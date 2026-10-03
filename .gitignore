@@ -1,0 +1,16 @@
+# build / tooling
+.pio/
+.vscode/*
+!.vscode/extensions.json
+__pycache__/
+.venv/
+.DS_Store
+
+# local-only planning notes
+HANDOFF_VSCODE.md
+
+# secrets and shipped binaries (never commit; distribute zips via GitHub Releases)
+include/secrets.h
+*.zip
+flash_bundle/
+*.bin

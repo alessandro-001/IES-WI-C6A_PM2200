@@ -1,0 +1,335 @@
+<title>PM2200 Power Meter Proposal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: single reading column, flow diagram first, then steps, then needs/risks. Amber accent = "energy". */
+:root {
+  --bg: #f6f6f3;
+  --surface: #ffffff;
+  --surface-2: #eeeeea;
+  --fg: #1f2328;
+  --muted: #5d636b;
+  --line: #d9d9d3;
+  --accent: #b45309;
+  --accent-fill: #f59e0b;
+  --accent-soft: #fdf1dc;
+  --phase1: #b45309;
+  --phase2: #2f6f8f;
+  --phase3: #5b6b3a;
+  --ok: #2f7d4f;
+  --ok-soft: #e4f2ea;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171a; --surface: #1d2024; --surface-2: #262a2f; --fg: #e8e9ea; --muted: #9aa1a9; --line: #343a41;
+    --accent: #f5a524; --accent-fill: #f5a524; --accent-soft: #2e2615;
+    --phase1: #f5a524; --phase2: #6fb3d2; --phase3: #a3b87a; --ok: #5fc08a; --ok-soft: #1c2d24;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171a; --surface: #1d2024; --surface-2: #262a2f; --fg: #e8e9ea; --muted: #9aa1a9; --line: #343a41;
+  --accent: #f5a524; --accent-fill: #f5a524; --accent-soft: #2e2615;
+  --phase1: #f5a524; --phase2: #6fb3d2; --phase3: #a3b87a; --ok: #5fc08a; --ok-soft: #1c2d24;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--f-body); font-size: 16px; line-height: 1.6; padding-inline: 16px; padding-block: 32px 64px; }
+.wrap { max-width: 880px; margin-inline: auto; display: flex; flex-direction: column; gap: 48px; }
+h1, h2, h3 { text-wrap: balance; line-height: 1.2; margin: 0; }
+h1 { font-size: clamp(1.9rem, 5vw, 2.6rem); font-weight: 600; letter-spacing: -0.01em; }
+h2 { font-size: 1.35rem; font-weight: 600; }
+h3 { font-size: 1rem; font-weight: 600; }
+p { margin: 0; max-width: 68ch; }
+.eyebrow { font-family: var(--f-mono); font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 24px; color: var(--muted); font-size: 0.9rem; }
+.meta b { color: var(--fg); font-weight: 500; }
+section { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.lede { font-size: 1.1rem; color: var(--fg); }
+
+/* hero wave */
+.hero { display: flex; flex-direction: column; gap: 20px; }
+.wave { width: 100%; height: 64px; display: block; }
+.wave path { fill: none; stroke-width: 2; stroke-linecap: round; }
+
+/* flow */
+.flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr; align-items: stretch; gap: 8px; }
+.node { background: var(--surface); border: 1.5px solid var(--line); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.node.new { border-color: var(--accent-fill); background: var(--accent-soft); }
+.node .tag { font-family: var(--f-mono); font-size: 0.68rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.node.new .tag { color: var(--accent); }
+.node .name { font-weight: 600; font-size: 0.95rem; line-height: 1.25; }
+.node .sub { font-size: 0.8rem; color: var(--muted); line-height: 1.4; }
+.link { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-family: var(--f-mono); font-size: 0.68rem; color: var(--muted); }
+.link svg { width: 44px; height: 14px; }
+.link svg line, .link svg polyline { stroke: var(--muted); stroke-width: 1.8; fill: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 0.82rem; color: var(--muted); }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1.5px solid var(--line); background: var(--surface); }
+.legend i.new { border-color: var(--accent-fill); background: var(--accent-soft); }
+@media (max-width: 720px) {
+  .flow { grid-template-columns: 1fr; }
+  .link { flex-direction: row; padding-block: 2px; }
+  .link svg { transform: rotate(90deg); width: 30px; }
+}
+
+/* deliverables */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.card p { font-size: 0.9rem; color: var(--muted); }
+.readings { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { font-family: var(--f-mono); font-size: 0.78rem; background: var(--surface-2); border-radius: 999px; padding: 3px 12px; }
+.chip.key { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
+
+/* steps */
+.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.step { display: grid; grid-template-columns: 40px 1fr; gap: 0 14px; position: relative; padding-bottom: 20px; }
+.step:last-child { padding-bottom: 0; }
+.step::before { content: ""; position: absolute; left: 19px; top: 40px; bottom: 0; width: 2px; background: var(--line); }
+.step:last-child::before { display: none; }
+.dot { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; font-family: var(--f-mono); font-weight: 500; font-size: 0.9rem; background: var(--surface); border: 2px solid var(--phase2); color: var(--phase2); }
+.step.hw .dot { border-color: var(--accent-fill); color: var(--accent); background: var(--accent-soft); }
+.step .body { display: flex; flex-direction: column; gap: 4px; padding-top: 6px; min-width: 0; }
+.step .body p { font-size: 0.92rem; color: var(--muted); }
+.step .see { font-size: 0.85rem; background: var(--surface); border: 1px dashed var(--line); border-radius: 6px; padding: 6px 10px; margin-top: 4px; }
+.step .see b { font-family: var(--f-mono); font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-right: 6px; font-weight: 500; }
+.badge { display: inline-block; font-family: var(--f-mono); font-size: 0.68rem; letter-spacing: 0.05em; text-transform: uppercase; padding: 2px 8px; border-radius: 4px; margin-left: 8px; vertical-align: 2px; }
+.badge.no { background: var(--ok-soft); color: var(--ok); }
+.badge.yes { background: var(--accent-soft); color: var(--accent); }
+.band { display: grid; grid-template-columns: 6fr 1fr; gap: 6px; font-family: var(--f-mono); font-size: 0.72rem; }
+.band div { padding: 8px 10px; border-radius: 6px; line-height: 1.3; }
+.band .a { background: var(--ok-soft); color: var(--ok); }
+.band .b { background: var(--accent-soft); color: var(--accent); }
+@media (max-width: 560px) { .band { grid-template-columns: 1fr; } }
+
+/* mockup */
+.mock { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+.mock-note { font-size: 0.82rem; color: var(--muted); }
+.mock-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.dev { border: 1px solid var(--line); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 10px; background: var(--bg); min-width: 0; }
+.dev-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dev-head .id { font-family: var(--f-mono); font-size: 0.78rem; color: var(--muted); }
+.dev-vals { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.85rem; color: var(--muted); }
+.dev-vals b { color: var(--fg); font-weight: 500; }
+.btn { align-self: flex-start; font-family: var(--f-body); font-size: 0.82rem; font-weight: 500; padding: 6px 12px; border-radius: 6px; border: 1.5px solid var(--accent-fill); color: var(--accent); background: var(--accent-soft); }
+.btn.ghost { border-color: var(--line); color: var(--muted); background: transparent; }
+.power { display: flex; flex-direction: column; gap: 12px; }
+.big { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.big .n { font-size: 2.2rem; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.big .u { color: var(--muted); font-family: var(--f-mono); font-size: 0.9rem; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { font-weight: 500; color: var(--muted); font-size: 0.75rem; font-family: var(--f-mono); text-transform: uppercase; letter-spacing: 0.05em; }
+.spark { width: 100%; height: 56px; display: block; }
+.spark .area { fill: var(--accent-soft); }
+.spark .ln { fill: none; stroke: var(--accent-fill); stroke-width: 2; }
+.spark .grid { stroke: var(--line); stroke-width: 1; }
+.spark circle { fill: var(--accent-fill); }
+
+/* lists */
+.ask { display: flex; flex-direction: column; gap: 10px; counter-reset: ask; list-style: none; padding: 0; margin: 0; }
+.ask li { counter-increment: ask; display: grid; grid-template-columns: 28px 1fr; gap: 10px; }
+.ask li::before { content: counter(ask); width: 28px; height: 28px; border-radius: 50%; background: var(--surface-2); display: grid; place-items: center; font-family: var(--f-mono); font-size: 0.8rem; }
+.ask li div { min-width: 0; }
+.ask strong { font-weight: 600; }
+.risks { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.risk { border-left: 3px solid var(--accent-fill); padding: 4px 0 4px 14px; font-size: 0.92rem; color: var(--muted); display: flex; flex-direction: column; gap: 2px; }
+.risk h3 { color: var(--fg); }
+.approve { background: var(--surface); border: 1.5px solid var(--line); border-radius: 10px; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.approve ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.approve li { display: flex; gap: 10px; align-items: flex-start; }
+.approve li::before { content: ""; width: 16px; height: 16px; border: 1.5px solid var(--muted); border-radius: 3px; flex: none; margin-top: 4px; }
+.approve .blank { border-bottom: 1px solid var(--muted); display: inline-block; min-width: 160px; }
+footer { color: var(--muted); font-size: 0.8rem; }
+</style>
+
+<div class="wrap">
+
+  <header class="hero">
+    <div class="eyebrow">Proposal for approval</div>
+    <h1>Adding power metering to the IES-WI-C6A</h1>
+    <p class="lede">BossFarm, our client, wants to see a site's electricity use on their dashboard. We can deliver that by teaching our IES-WI-C6A device to read a Schneider PM2200 power meter. This page explains the plan and what needs your approval to start.</p>
+    <div class="meta">
+      <span>Client <b>BossFarm</b></span>
+      <span>Prepared by <b>Alessandro Frondini</b></span>
+      <span>October 2026</span>
+    </div>
+    <svg class="wave" id="wave" viewBox="0 0 800 64" preserveAspectRatio="none" role="img" aria-label="Three phase-shifted sine waves, one for each electrical line"></svg>
+  </header>
+
+  <section class="approve">
+    <h2>Decisions needed from you</h2>
+    <ul>
+      <li><span><b>Approve the plan and scope</b> described below: a new firmware and installer for the IES-WI-C6A that reads the PM2200 and sends the readings to the existing server and dashboard.</span></li>
+      <li><span><b>Approve getting a PM2200 for final testing</b>, either borrowed from BossFarm or purchased. Everything else is built and tested without it.</span></li>
+      <li><span><b>Agree that we go back to BossFarm</b> with three questions (meter model, meter settings, how they want it shown on the dashboard) listed further down.</span></li>
+    </ul>
+    <p>Nothing in the existing products changes. The current sensors, firmware and installer stay exactly as they are.</p>
+  </section>
+
+  <section>
+    <h2>The request in one picture</h2>
+    <div class="flow">
+      <div class="node">
+        <span class="tag">Measures</span>
+        <span class="name">PM2200 power meter</span>
+        <span class="sub">Measures the 3 lines of the electrical supply</span>
+      </div>
+      <div class="link"><span>RS485</span><svg viewBox="0 0 44 14"><line x1="2" y1="7" x2="40" y2="7"/><polyline points="34,2 41,7 34,12"/></svg></div>
+      <div class="node new">
+        <span class="tag">New firmware</span>
+        <span class="name">IES-WI-C6A device</span>
+        <span class="sub">Reads the meter every few seconds</span>
+      </div>
+      <div class="link"><span>WiFi</span><svg viewBox="0 0 44 14"><line x1="2" y1="7" x2="40" y2="7"/><polyline points="34,2 41,7 34,12"/></svg></div>
+      <div class="node">
+        <span class="tag">Existing</span>
+        <span class="name">Raspberry Pi server</span>
+        <span class="sub">Already stores our sensor data</span>
+      </div>
+      <div class="link"><span>Online</span><svg viewBox="0 0 44 14"><line x1="2" y1="7" x2="40" y2="7"/><polyline points="34,2 41,7 34,12"/></svg></div>
+      <div class="node">
+        <span class="tag">Existing</span>
+        <span class="name">BossFarm dashboard</span>
+        <span class="sub">Shows the consumption next to other data</span>
+      </div>
+    </div>
+    <div class="legend"><span><i class="new"></i>New work in this project</span><span><i></i>Already in place, no new infrastructure</span></div>
+    <p>Our device already has the RS485 hardware on board, so no hardware change is needed. The work is software: the device firmware, an installer, and adding the new data to the server and dashboard BossFarm already use.</p>
+  </section>
+
+  <section>
+    <h2>What will be delivered</h2>
+    <div class="cards">
+      <div class="card"><h3>Power-meter firmware</h3><p>A dedicated version of the device software that reads the PM2200 and sends its data. WiFi and server setup work the same way as on today's devices.</p></div>
+      <div class="card"><h3>Dedicated flasher tool</h3><p>A separate installer with its own name and colour, so the power-meter software cannot be confused with the existing sensor tool.</p></div>
+      <div class="card"><h3>Meter simulator</h3><p>A software stand-in for the PM2200, so everything can be built and tested before the physical meter is available.</p></div>
+      <div class="card"><h3>Dashboard integration</h3><p>The power data stored on the Raspberry Pi and prepared for the dashboard, alongside the existing sensor data.</p></div>
+      <div class="card"><h3>Commissioning checklist</h3><p>A short step-by-step guide for connecting a real meter and checking the readings against the meter's own display.</p></div>
+    </div>
+    <h3>Readings reported to the dashboard</h3>
+    <div class="readings">
+      <span class="chip">Voltage L1 L2 L3</span>
+      <span class="chip">Current L1 L2 L3</span>
+      <span class="chip">Power per line</span>
+      <span class="chip">Total power</span>
+      <span class="chip">Power factor</span>
+      <span class="chip">Frequency</span>
+      <span class="chip key">Energy consumed in Wh</span>
+    </div>
+    <p>The Wh figure is read straight from the meter's own energy counter, so it stays correct even if the device restarts.</p>
+  </section>
+
+  <section>
+    <h2>Work order</h2>
+    <p>Each step ends with something visible that can be reviewed before the next one starts. Steps 1 to 6 can be completed without the physical meter.</p>
+    <div class="band" aria-hidden="true">
+      <div class="a">Steps 1 to 6: no meter needed</div>
+      <div class="b">Step 7: meter</div>
+    </div>
+    <ol class="steps">
+      <li class="step"><div class="dot">1</div><div class="body"><h3>Specification</h3><p>Fix the exact list of measurements and the data format sent to the server.</p><div class="see"><b>You see</b>A short reference document</div></div></li>
+      <li class="step"><div class="dot">2</div><div class="body"><h3>Simulated meter</h3><p>A program that behaves like a PM2200 connected to a device.</p><div class="see"><b>You see</b>Realistic meter readings printed live on screen</div></div></li>
+      <li class="step"><div class="dot">3</div><div class="body"><h3>Simulated dashboard page</h3><p>A simple page that shows those readings live.</p><div class="see"><b>You see</b>Voltage, current, power and a running Wh counter updating in a browser</div></div></li>
+      <li class="step"><div class="dot">4</div><div class="body"><h3>Device firmware</h3><p>The device runs the new software, using simulated meter data for now.</p><div class="see"><b>You see</b>A real device sending power data to the server with no meter attached</div></div></li>
+      <li class="step"><div class="dot">5</div><div class="body"><h3>Server and dashboard integration</h3><p>Store the data on the Raspberry Pi and prepare it for the dashboard.</p><div class="see"><b>You see</b>Power data available next to the existing sensors</div></div></li>
+      <li class="step"><div class="dot">6</div><div class="body"><h3>Flasher tool</h3><p>The dedicated tool for installing the firmware on devices.</p><div class="see"><b>You see</b>A ready-to-use installer for the team</div></div></li>
+      <li class="step hw"><div class="dot">7</div><div class="body"><h3>Real-meter commissioning <span class="badge yes">Needs meter</span></h3><p>Connect a PM2200 to a device and verify the readings.</p><div class="see"><b>You see</b>Device readings matching the meter's own display</div></div></li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>How consumption could appear on the dashboard</h2>
+    <p>Meters will be connected to different devices, so our proposal is to attach the power view to each device card. The mock-up below is only an idea to confirm with BossFarm. The final look is decided together once the data is flowing.</p>
+    <div class="mock">
+      <div class="mock-note">Illustrative mock-up. All numbers are example values.</div>
+      <div class="mock-row">
+        <div class="dev">
+          <div class="dev-head"><h3>Greenhouse A</h3><span class="id">Device PM_xxxx</span></div>
+          <div class="dev-vals"><span>Temp <b>22.5 °C</b></span><span>Humidity <b>61 %</b></span></div>
+          <span class="btn">Power consumption</span>
+        </div>
+        <div class="dev">
+          <div class="dev-head"><h3>Greenhouse B</h3><span class="id">Device ENV_xxxx</span></div>
+          <div class="dev-vals"><span>Temp <b>21.9 °C</b></span><span>Humidity <b>58 %</b></span></div>
+          <span class="btn ghost">No power meter linked</span>
+        </div>
+      </div>
+      <div class="power">
+        <div class="big"><span class="n">48,215</span><span class="u">Wh consumed</span></div>
+        <svg class="spark" viewBox="0 0 400 56" preserveAspectRatio="none" role="img" aria-label="Example power curve over time">
+          <line class="grid" x1="0" y1="14" x2="400" y2="14"/><line class="grid" x1="0" y1="28" x2="400" y2="28"/><line class="grid" x1="0" y1="42" x2="400" y2="42"/>
+          <path class="area" d="M0,40 L40,34 L80,38 L120,26 L160,30 L200,18 L240,24 L280,16 L320,22 L360,14 L400,18 L400,56 L0,56 Z"/>
+          <path class="ln" d="M0,40 L40,34 L80,38 L120,26 L160,30 L200,18 L240,24 L280,16 L320,22 L360,14 L400,18"/>
+          <circle cx="400" cy="18" r="3.5"/>
+        </svg>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Line</th><th>Voltage</th><th>Current</th><th>Power</th></tr></thead>
+            <tbody>
+              <tr><td>L1</td><td>231.4 V</td><td>6.8 A</td><td>1.52 kW</td></tr>
+              <tr><td>L2</td><td>229.8 V</td><td>5.9 A</td><td>1.31 kW</td></tr>
+              <tr><td>L3</td><td>230.6 V</td><td>7.1 A</td><td>1.58 kW</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>What we need to confirm with BossFarm</h2>
+    <p>These do not block the first six steps. They need answers before the real-meter step.</p>
+    <ol class="ask">
+      <li><div><strong>Dashboard display.</strong> Is the per-device card idea above what they want? The exact look can be decided once data is flowing.</div></li>
+      <li><div><strong>Meter model.</strong> Which PM2200 variant they will deploy: PM2210, PM2220 or PM2230. The PM2230 adds harmonic analysis if that is ever of interest.</div></li>
+      <li><div><strong>Meter settings.</strong> The communication settings configured on their meter (address, speed, parity), or permission for us to set them at installation.</div></li>
+      <li><div><strong>Test meter.</strong> Whether they can lend us one PM2200 for the final check in step 7, otherwise we purchase one.</div></li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Assumptions and risks</h2>
+    <div class="risks">
+      <div class="risk"><h3>Meter data layout</h3><span>Schneider publishes the meter's internal data addresses separately. They will be checked against the official documentation before a real meter is connected. Until then, values are verified against the simulator only.</span></div>
+      <div class="risk"><h3>Real-world check</h3><span>Wiring, communication settings and reading accuracy can only be fully confirmed with the physical meter, in step 7.</span></div>
+      <div class="risk"><h3>First version scope</h3><span>Voltage, current, power, power factor, frequency and Wh energy. Reactive power, harmonics or energy exported to the grid can be added later without changing what is delivered now.</span></div>
+      <div class="risk"><h3>Existing devices unaffected</h3><span>The current sensor firmware and flasher stay as they are. The power-meter version is separate.</span></div>
+    </div>
+  </section>
+
+  <section class="approve">
+    <h2>Approval</h2>
+    <p>Please reply to confirm:</p>
+    <ul>
+      <li>The scope and work order above are approved</li>
+      <li>We may source a PM2200 for final testing (borrowed or purchased)</li>
+      <li>We may go back to BossFarm with the confirmation questions above</li>
+    </ul>
+    <p>Comments or changes: <span class="blank"></span></p>
+  </section>
+
+  <footer>IES-WI-C6A power meter integration, internal proposal. Example values in the mock-up are illustrative only.</footer>
+</div>
+
+<script>
+// three phase-shifted sine waves, one per line
+(function () {
+  var svg = document.getElementById('wave');
+  if (!svg) return;
+  var colors = ['var(--phase1)', 'var(--phase2)', 'var(--phase3)'];
+  var html = '';
+  for (var p = 0; p < 3; p++) {
+    var d = '';
+    for (var x = 0; x <= 800; x += 8) {
+      var y = 32 - 26 * Math.sin((x / 800) * Math.PI * 6 - p * 2 * Math.PI / 3);
+      d += (x ? 'L' : 'M') + x + ',' + y.toFixed(1);
+    }
+    html += '<path d="' + d + '" stroke="' + colors[p] + '"/>';
+  }
+  svg.innerHTML = html;
+})();
+</script>
