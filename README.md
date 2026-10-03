@@ -1,472 +1,272 @@
-# IES-WI-C6A x BossFarm Smart Monitor — Firmware Implementation
-
+# IES-WI-C6A x BossFarm — PM2200 Power Meter Firmware
 
 ![ESP32-C6](https://img.shields.io/badge/ESP32--C6-DevKitC--1-blue?style=flat-square)
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-Arduino-orange?style=flat-square)
-![SCD40](https://img.shields.io/badge/SCD40-CO2,_Temperature,_Humidity_Sensor-00a6d6?style=flat-square)
-![LDR](https://img.shields.io/badge/LDR-Light_Detection-yellow?style=flat-square)
+![PM2200](https://img.shields.io/badge/Schneider-EasyLogic_PM2200-3dcd58?style=flat-square)
+![Modbus](https://img.shields.io/badge/Modbus-RTU_RS485-00a6d6?style=flat-square)
 ![NeoPixel](https://img.shields.io/badge/NeoPixel-WS2812B-purple?style=flat-square)
 ![Local MQTT](https://img.shields.io/badge/Local_MQTT-Mosquitto-green?style=flat-square)
-![Firmware](https://img.shields.io/badge/Firmware-v2.0.0-lightgrey?style=flat-square)
+![Firmware](https://img.shields.io/badge/Firmware-v1.0.0-lightgrey?style=flat-square)
 
 ---
-ESP32-C6 firmware for environmental monitoring with local MQTT publishing, persistent NVS storage, and dynamic sensor type configuration.
-
----
-
-## Board Migration Notes (C3 → C6)
-
-This firmware targets the **ESP32-C6** (IES-WI-C6A). Key differences from the previous C3 build:
-
-- **Platform:** `pioarduino` fork required — `espressif32@6.9.0` has no C6 support. Uses `arduino-esp32 3.x` (IDF 5.x).
-- **Board string:** `esp32-c6-devkitc-1`
-- **I2C pins swapped:** SDA=GPIO6, SCL=GPIO7 (C3 had them reversed)
-- **ADC attenuation:** `ADC_11db` removed in arduino-esp32 3.x; default 12dB attenuation used instead via `pinMode(INPUT)`
-- **Upload:** `board_upload.use_1200bps_touch` removed (SAMD-only trick, causes C6 upload hangs)
-
----
-
-## Architecture Overview
-
-### Module Structure
+ESP32-C6 firmware for the **IES-WI-C6A** board that reads a **Schneider EasyLogic PM2200** three-phase power meter over RS485 (Modbus RTU) and publishes voltage, current, power and energy over WiFi/MQTT to the BossFarm Raspberry Pi, for the online dashboard. This firmware has one job: there are no other sensors in it.
 
 ```
-sensors.h ← Single source of truth for all sensor state
-├── scd40.cpp/h                 (SCD40 CO2 driver, raw I2C)
-├── ldr.cpp/h                   (LDR light detection)
-└── extern declarations         (sensorTemp, sensorHum, sensorCO2, ldrLightOn, alert flags)
-
-main.cpp                        (setup/loop, sensor reads, LED, MQTT publish, WiFi fallback)
-├── scd40Read()                 (5s interval via polling)
-├── ldrRead()                   (5s interval via polling)
-├── NeoPixel ring               (20ms update, status colour)
-└── MQTT publish                (5s telemetry, 60s attributes)
-
-local_mqtt.cpp/h                (MQTT connection to Raspberry Pi broker)
-├── localMqttPublish()          (telemetry: temp, hum, CO2, light)
-├── localMqttPublishConfig()    (attributes: thresholds, firmware, MAC)
-├── Sensor type dispatch        (ENV/SOIL/MIN topic routing)
-└── NVS broker storage
-
-web_server.cpp/h                (HTTP server, captive portal, single-page UI)
-├── handleRoot()                (HTML UI)
-├── handleSensors()             (live JSON)
-├── handleSetWifi()             (WiFi provisioning)
-├── handleSetThresh()           (threshold persistence)
-├── handleSetSensorType()       (type 1/2/3 selection)
-└── Log buffer                  (circular 40-line buffer)
-
-wifi_config.cpp/h               (WiFi credential storage & connection)
-├── wifiConfigSave()            (NVS netcfg namespace)
-├── wifiConfigConnect()         (STA connection with timeout)
-└── wifiApStart()               (AP mode for configuration)
-
-factory_reset.cpp/h             (GPIO5 button, 5s hold detection)
-└── factoryResetExecute()       (clears all NVS namespaces, white LED flash before reboot)
-
+PM2200 --RS485 / Modbus RTU--> IES-WI-C6A (this firmware) --WiFi / MQTT--> Raspberry Pi
+                                                           (Mosquitto -> bridge -> InfluxDB -> dashboard)
 ```
 
-### Global State (sensors.h)
-
-All sensor state is declared as `extern` in `sensors.h` and defined in their respective driver files:
-
-```cpp
-// From scd40.cpp
-extern float    sensorTemp;    // Temperature (°C)
-extern float    sensorHum;     // Humidity (%)
-extern uint16_t sensorCO2;     // CO2 (ppm)
-extern bool     sensorOK;      // Sensor initialized
-extern bool     alertTemp;     // Temp threshold exceeded
-extern bool     alertHum;      // Humidity threshold exceeded
-extern bool     alertCO2;      // CO2 threshold exceeded
-
-// From ldr.cpp
-extern bool ldrLightOn;        // Light detected
-extern bool ldrOK;             // Sensor initialized
-```
-
-This ensures **no module directly includes sensor drivers** — everything goes through `sensors.h`.
+> **Status:** built and tested against a *simulated* meter only. No real PM2200 has been connected yet and the Modbus register addresses are unverified. See [Status and known limitations](#status-and-known-limitations).
 
 ---
 
-## Sensor Drivers
+## What it does
 
-### SCD40 (scd40.cpp)
-
-**Raw I2C implementation** — no external library. Implements Sensirion protocol with CRC-8 validation.
-
-**Timing:**
-- I2C clock: 100 kHz
-- Periodic measurement: 5-second interval
-- First valid reading: ~5.2 seconds after boot
-- Poll interval: 1 second (checks data-ready flag)
-- Minimum read interval: 5.2 seconds (enforced)
-
-**CRC-8 Validation:**
-- Polynomial: `0x31`
-- Every 16-bit word has an 8-bit CRC byte
-- All reads and writes validated before accepting
-
-**Command Set:**
-```cpp
-0x21B1  START_PERIODIC_MEASUREMENT
-0xEC05  READ_MEASUREMENT           (3 words: CO2, temp, humidity)
-0x3F86  STOP_PERIODIC_MEASUREMENT
-0xE4B8  GET_DATA_READY_STATUS
-0x3682  GET_SERIAL_NUMBER
-0x202F  GET_SENSOR_VARIANT
-```
-
-**Data Conversion:**
-```cpp
-CO2_ppm = word0
-Temperature_C = -45 + 175 * word1 / 65535
-Humidity_% = 100 * word2 / 65535
-```
-
-**Sanity Checks:**
-- Temperature: -40°C to 120°C
-- Humidity: 0% to 100%
-- CO2: 0 to 40,000 ppm (rejects if >40k)
-- Any CRC failure: frame discarded, retry on next poll
-
-**Debug Output:**
-```
-[SCD40] DataReady raw=0x0800 ready=YES
-[SCD40 RAW] 02 84 4F  5C 4A AB  85 54 69   (3 words + 3 CRCs)
-[SCD40] CRC CO2=OK TEMP=OK HUM=OK
-[SCD40] Decoded rawCO2=644 rawT=23626 rawH=34132 -> CO2=644 T=22.78 H=53.29
-[SCD40] T:22.8°C H:53.3% CO2:644 ppm (Good)
-```
-
-### LDR (ldr.cpp)
-
-**Voltage divider ADC input** on GPIO0.
-
-**Timing:**
-- Reads every 5 seconds (synced with sensor interval)
-- 5 samples taken with 5ms delay between reads
-- Minimum valid reading requires 3+ valid ADC values (filters spikes)
-
-**Logic:**
-- ADC value > threshold → light ON
-- ADC value ≤ threshold → light OFF
-- Threshold adjustable in `config.h` (default: 50)
-
-**Note (C6 / arduino-esp32 3.x):** `analogSetPinAttenuation()` with `ADC_11db` is removed. Default 12dB attenuation is applied automatically. `ldrInit()` uses `pinMode(INPUT)` only — no IDF GPIO calls.
+- Polls the meter every 5 s and publishes the readings to the Pi's MQTT broker: voltage L-N and L-L, current (per phase, average, neutral), active / reactive / apparent power (per phase and total), power factor, frequency, unbalance, and cumulative energy delivered and received.
+- Serves a setup page on the board: WiFi commissioning, live readings (tables and charts), Modbus settings, device log, factory reset. A discovery page lists the boards on the network with a power / energy summary for each.
+- Has a **simulation mode** that generates realistic meter values, so the whole board → WiFi → MQTT path can run with no meter attached.
+- Keeps the commissioning model, NeoPixel status ring and factory-reset behaviour of the earlier BossFarm sensor firmware.
 
 ---
 
-## Main Loop Flow (main.cpp)
+## Hardware and wiring
 
-### setup()
+Board: **IES-WI-C6A** (ESP32-C6, MAX3485 RS485 transceiver already on the board). No extra hardware.
 
-1. Serial init (115200 baud)
-2. NeoPixel init + clear
-3. Factory reset button init
-4. SCD40 init (I2C, periodic measurement start)
-5. LDR init (ADC setup)
-6. WiFi init:
-   - Mode: WIFI_AP_STA
-   - AP always enabled (unique SSID from MAC)
-   - Load saved WiFi credentials
-   - If commissioned: attempt STA connection (15s timeout)
-   - If not commissioned: AP visible, no STA attempt
-7. Web server init (HTTP on port 80)
-8. Load thresholds from NVS
+| Function | Pin |
+|---|---|
+| RS485 TX (UART1, to MAX3485 DI) | GPIO16 |
+| RS485 RX (UART1, from MAX3485 RO) | GPIO17 |
+| RS485 DE + RE (HIGH = transmit, LOW = receive) | GPIO14 |
+| NeoPixel status ring (12 x WS2812B) | GPIO20 |
+| Factory-reset button (hold 5 s) | GPIO5 |
 
-### loop()
+The console is USB-CDC at 115200 baud, so the UART0 pads are free for RS485.
 
-**Execution order (runs every ~1ms):**
+**RS485 cabling** (from the PM2200 manual, `docs/PM2200-datasheet.PDF`):
 
-1. **Web server handle** (non-blocking)
-2. **Local MQTT handle** (non-blocking, 5s reconnect)
-3. **Provisioning handle** (optional)
-4. **Factory reset check** (GPIO5 hold detection)
-5. **Delay 1ms** (prevent watchdog, allow background tasks)
+- One RS485 port per meter, Modbus RTU, up to 32 devices on a bus, 1000 m maximum.
+- Shielded cable with 2 twisted pairs (or 1.5): one pair for the (+) and (-) data lines, the other wire for the **C** (common) terminals. Connect (+) to (+) and (-) to (-); if the meter does not answer, try swapping the pair.
+- Connect the shield wire to the shield terminal and ground it at one end only.
+- Terminate both ends of the bus with 120 ohm.
 
-**Every 5 seconds (sensor interval):**
-- Clear LED ring
-- LDR read
-- Show updated LED (status colour)
+**Meter settings** (set on the meter's front panel, *Maint > Setup > Comm*; the manual does not state the factory defaults, so read them from the meter):
 
-**Every 20ms (LED update):**
-- Factory reset button held → Yellow
-- Not commissioned → Blue
-- Commissioned, no WiFi → Red
-- Commissioned + WiFi, no MQTT → Amber
-- Commissioned + WiFi + MQTT → Green
+| Setting | Allowed values |
+|---|---|
+| Slave address | 1 to 247 |
+| Baud rate | 4800, 9600, 19200, 38400 |
+| Parity | Even or Odd (1 stop bit), None (2 stop bits) |
 
-**Factory reset LED sequence:**
-- Button held (5s): Yellow
-- Reset complete: White (2s)
-- After reboot: Blue (not commissioned)
-
-**Every 5 seconds (MQTT publish):**
-- Local MQTT: publish telemetry
-- If commissioned: update alertTemp, alertHum, alertCO2
-
-**Every 30 seconds (health log):**
-- Log free heap, uptime, WiFi status, MQTT status, RSSI
-
-**WiFi fallback logic:**
-- If WiFi disconnected for >30s: re-enable AP
-- Retry STA every 120s if commissioned and credentials exist
-- If reconnected: disable AP, enable mDNS
+Enter the same values in the board's setup page (*Meter Settings*). We only read from the meter; its configuration is the installer's.
 
 ---
 
-## Local MQTT (local_mqtt.cpp)
+## Registering a board (step by step)
 
-### Publishing
+1. **Flash the firmware** (see [Build and flash](#build-and-flash)).
+2. **Power on.** The NeoPixel ring goes white (booting), cyan (hotspot up), then blue (not commissioned).
+3. **Join the board's hotspot**: SSID `PM2200_Hotspot_XXXX` (last 4 characters of the MAC), password `AP_PASSWORD` from `include/secrets.h`.
+4. **Open `http://192.168.4.1`** (most phones open it through the captive portal).
+5. In the **WiFi Connection** card, press **Scan Networks**, pick the site network, enter the password and press **Connect**.
+6. On success a confirmation screen shows the board's IP and `.local` name. The hotspot turns off and the board joins the network and connects to the MQTT broker. The LED goes red (no WiFi), amber (WiFi, no broker), then green (broker connected).
+7. Open `http://<ip>` or `http://bossfarm-<last4>.local` and set **Meter Settings**. Choose **Data source: PM2200 meter (RS485)** for a real meter.
 
-**Telemetry (every 5 seconds):**
+The board is now commissioned. The hotspot only comes back if WiFi is lost for more than 30 s, or after a factory reset.
 
-Topic: `sensors/{DEVICE_ID}/{MEASUREMENT_TYPE}`
-
-Device IDs by type:
-- Type 1: `ENV_{LAST_4_MAC_CHARS}` (e.g., `ENV_61D4`)
-- Type 2: `SOIL_{LAST_4_MAC_CHARS}`
-- Type 3: `MIN_{LAST_4_MAC_CHARS}`
-
-Measurement types:
-- Type 1: `telemetry`
-- Type 2: `soil`
-- Type 3: `mineral`
-
-Example payload (Type 1):
-```json
-{
-  "device_id": "ENV_61D4",
-  "timestamp": "2024-05-25T14:30:45Z",
-  "reading": {
-    "sensor_type": 1,
-    "sensor_type_label": "environment",
-    "firmware": "2.0.0",
-    "rssi": -65,
-    "temperature": 22.50,
-    "humidity": 55.00,
-    "co2": 650,
-    "eco2": 650,
-    "co2_label": "Good",
-    "co2_valid": true,
-    "alert_temp": false,
-    "alert_temp_num": 0,
-    "alert_hum": false,
-    "alert_hum_num": 0,
-    "alert_co2": false,
-    "alert_co2_num": 0,
-    "light_on": true,
-    "light_on_num": 1
-  }
-}
-```
-
-**Attributes (every 60 seconds, forced after reconnect):**
-
-Topic: `sensors/{DEVICE_ID}/attributes`
-
-```json
-{
-  "device_id": "ENV_61D4",
-  "timestamp": "2024-05-25T14:30:45Z",
-  "reading": {
-    "mac": "A4CF12AA61D4",
-    "ip": "192.168.0.42",
-    "rssi": -65,
-    "firmware": "2.0.0",
-    "sensor_type": 1,
-    "sensor_type_label": "environment",
-    "highTempThreshold": 30.00,
-    "lowTempThreshold": 5.00,
-    "highHumThreshold": 80.00,
-    "lowHumThreshold": 20.00,
-    "highEco2Threshold": 1000.00
-  }
-}
-```
-
----
-
-## Configuration (config.h)
-
-```cpp
-// Access Point
-#define AP_SSID             "ESP32C6_Hotspot"
-
-// Hardware Pins — ESP32-C6
-#define NEOPIXEL_PIN        20
-#define NUM_LEDS            12
-#define BRIGHTNESS          10
-#define I2C_SDA             6   // ← swapped vs C3
-#define I2C_SCL             7   // ← swapped vs C3
-#define LDR_PIN             0
-#define FACTORY_RESET_PIN   5
-
-// Timing
-#define SENSOR_INTERVAL     5000   // 5 seconds
-#define LED_INTERVAL        20     // 20ms
-
-// Temperature Range (for LED hue)
-#define TEMP_MIN            15.0f
-#define TEMP_MAX            35.0f
-
-// Thresholds
-#define LDR_THRESHOLD       50
-
-// Local MQTT (default)
-#define LOCAL_MQTT_SERVER   "weedsync.local"
-#define LOCAL_MQTT_PORT     1883
-
-// mDNS
-#define MDNS_PREFIX         "bossfarm"
-
-// Device
-#define FIRMWARE_VERSION    "2.0.0"
-#define TEMP_OFFSET_DEFAULT  0.0f  // °C — applied to raw SCD40 temperature
-#define SENSOR_TYPE_DEFAULT 1  // 1=Environment, 2=Soil, 3=Mineral
-```
-
----
-
-## Sensor Types
-
-### Type 1: Environment
-- **Topic:** `sensors/ENV_{MAC}/telemetry`
-- **Fields:** temperature, humidity, CO2, light
-
-### Type 2: Soil
-- **Topic:** `sensors/SOIL_{MAC}/soil`
-- **Sensor:** Halisense Soil 7-in-1 (RS485 Modbus RTU, 4800 baud)
-- **Fields:** moisture (%), temperature (°C), EC (uS/cm), pH, N, P, K (mg/kg)
-
-### Type 3: Mineral
-- **Topic:** `sensors/MIN_{MAC}/mineral`
-- **Sensor:** CWT-OYS-PHEC Water pH/EC (RS485 Modbus RTU, 9600 baud)
-- **Fields:** pH, EC (uS/cm), temperature (°C)
-
-**Current implementation:** Types 2 & 3 read live values over RS485 (see `src/sensors/rs485_sensor.cpp`).
-
----
-
-## Alert Thresholds
-
-**Defaults:**
-- `threshTemp`: 30.0°C max, 5.0°C min
-- `threshHum`: 80.0% max, 20.0% min
-- `threshCO2`: 1000.0 ppm max
-
-Alerts trigger on **strictly greater than** — equal does not trigger. Persisted in NVS, editable via web UI.
-
----
-
-## NVS Namespaces
-
-| Namespace | Keys | Purpose |
-|---|---|---|
-| `netcfg` | `ssid`, `pass` | WiFi credentials |
-| `thresholds` | `temp`, `temp_low`, `hum`, `hum_low`, `co2`, `temp_offset` | Alert thresholds & temperature calibration |
-| `device` | `commissioned`, `sensor_type` | Device state |
-| `broker` | `host`, `port` | MQTT broker address |
-| `provision` | `token`, `device_name` | Provisioning (disabled) |
-
----
-
-## Commissioning Model
-
-**First boot:** AP enabled, no WiFi, no MQTT. Connect to AP → open `192.168.4.1` → enter WiFi credentials → device commissions and starts publishing.
-
-**After commissioning:** AP disables, mDNS starts, MQTT connects. AP re-enables if WiFi drops for >30s.
-
----
-
-## Registering a Device (step by step)
-
-1. **Flash the firmware** (see [Build & Deployment](#build--deployment), or use the standalone flasher in `flash_tool/`).
-2. **Power on the board.** The NeoPixel ring goes white (booting) → cyan (AP up, sensors initializing) → blue (AP up, not yet commissioned).
-3. **Connect to the device's WiFi hotspot** — SSID `ESP32C6_Hotspot_XXXX` (last 4 MAC chars), password from `include/secrets.h`.
-4. **Open `http://192.168.4.1`** in a browser (most phones auto-prompt via the captive portal redirect).
-5. In the **Device Information** card, click **Environment**, **Soil**, or **Mineral** to match the sensor wired to this unit. The "Sensor Type" row updates immediately and the relevant live-data card (and chart) appears further down the page — confirm it's correct before continuing, since switching later requires reopening this same page.
-6. In the **WiFi Connection** card, click **Scan Networks**, select the home/site network, enter the password, and click **Connect**.
-7. On success, a confirmation screen shows the device's IP and `.local` hostname. The AP hotspot turns off and the device joins that network — the LED turns red (no WiFi yet), then green once MQTT connects.
-8. The device is now commissioned. Reach its UI going forward at `http://<ip>` or `http://<hostname>.local` (both shown in step 7) — the AP will only reappear if WiFi is lost for >30s or after a factory reset.
-
----
-
-## Build & Deployment
+**MQTT broker.** The default is `weedsync.local:1883`. To use another address (stored in NVS, kept across factory resets):
 
 ```bash
-# Build
-pio run -e esp32c6
-
-# Flash
-pio run -e esp32c6 --target upload
-
-# Monitor
-pio device monitor --baud 115200
-
-# Clean build
-pio run --target clean && pio run -e esp32c6 --target upload
+curl -X POST http://<board-ip>/set_broker -d "ip=192.168.0.16" -d "port=1883"
 ```
 
-**platformio.ini:**
-```ini
-[env:esp32c6]
-platform = https://github.com/pioarduino/platform-espressif32/releases/download/53.03.13/platform-espressif32.zip
-board     = esp32-c6-devkitc-1
-framework = arduino
+**LED states**
 
-monitor_speed = 115200
-upload_speed  = 921600
+| Colour | Meaning |
+|---|---|
+| White | Booting / factory reset done (2 s before reboot) |
+| Cyan | Hotspot up, starting |
+| Blue | Not commissioned |
+| Red | Commissioned, no WiFi |
+| Amber | WiFi up, MQTT broker not connected |
+| Green | WiFi and broker connected, data flowing |
+| Yellow | Factory-reset button held |
 
-upload_protocol = esptool
-board_upload.wait_for_upload_port = true
+---
 
-build_flags =
-    -DCORE_DEBUG_LEVEL=0
-    -DARDUINO_USB_MODE=1
-    -DARDUINO_USB_CDC_ON_BOOT=1
-    -DCONFIG_PM_ENABLE=0
+## Setup page
 
-lib_deps =
-    adafruit/Adafruit NeoPixel @ ^1.12.3
-    adafruit/Adafruit Unified Sensor @ ^1.1.14
-    adafruit/Adafruit BusIO @ ^1.16.1
-    knolleary/PubSubClient @ ^2.8.0
-    bblanchon/ArduinoJson@^6.21.0
+Served by the board at `/` (hotspot: `192.168.4.1`, network: its IP or `bossfarm-<last4>.local`):
+
+| Card | Content |
+|---|---|
+| Device Information | Device ID, firmware, IP, hostname, signal, network status |
+| WiFi Connection | Scan, connect |
+| Power Meter | Active power, energy (Wh), power factor and frequency tiles; per-phase table (L1, L2, L3, total) for V L-N, V L-L, current, neutral current, kW, kvar, kVA, PF; energy table (active, reactive, apparent; delivered and received); power and current charts (last 60 polls); a **SIMULATED** badge when the values are generated |
+| Meter Settings | Slave address, baud rate, parity, data source (meter or simulated) |
+| Device Log | Live log of the board |
+| Factory Reset | Clears WiFi credentials and commissioning |
+
+`/discover` scans a subnet (default `192.168.0.1-254`) for ESP32 units and shows each one's power, energy and mode; a card opens that unit's page.
+
+| Route | Purpose |
+|---|---|
+| `GET /power` | Live readings as JSON (same keys as the MQTT `reading`, plus status) |
+| `GET /meter`, `POST /set_meter` | Modbus settings (`addr`, `baud`, `parity`, `sim`) |
+| `GET /device_info`, `GET /wifi`, `GET /scan`, `POST /set_wifi` | Device info and WiFi commissioning |
+| `POST /register` | Connect with the stored credentials and start MQTT |
+| `POST /set_broker`, `GET /broker_status` | MQTT broker address and connection state |
+| `GET /logs`, `POST /factory_reset`, `GET /discover` | Log, reset, discovery page |
+
+---
+
+## MQTT
+
+| Topic | Retained | Interval |
+|---|---|---|
+| `sensors/PM_<last4mac>/power` | no | 5 s |
+| `sensors/PM_<last4mac>/attributes` | yes | 60 s and after each reconnect |
+
+`PM_<last4mac>` is the device ID: `PM_` plus the last 4 hex characters of the MAC. The broker has no authentication and the client ID is `ESP32C6-<MAC>`.
+
+```json
+{
+  "device_id": "PM_ABCD",
+  "reading": {
+    "sensor_type": 4,
+    "sensor_type_label": "power",
+    "firmware": "1.0.0",
+    "rssi": -60,
+    "sensor_ok": true,
+    "meter_ok": true,
+    "simulated": false,
+    "v1": 230.1, "v2": 229.8, "v3": 230.4,
+    "i1": 12.30, "i2": 11.90, "i3": 12.60,
+    "p1": 2650, "p2": 2540, "p3": 2700, "p_total_w": 7890,
+    "energy_wh": 1234567
+  }
+}
 ```
+
+The example is abridged: the full payload has 39 measurement keys (about 730 bytes). The complete key list, units and rules are in **[docs/payload.md](docs/payload.md)**. Points worth knowing:
+
+- Keys without a value are **left out** (never `null`): a value not read yet, or whose register address is still unknown.
+- `simulated: true` marks generated values, so a dashboard can tell them from real consumption.
+- The board never sets its clock, so `timestamp` is omitted and the Pi bridge stamps server time on receipt.
+- On a Modbus failure the last good values are kept; `sensor_ok` goes false after 3 consecutive failures.
+- The Raspberry Pi bridge lives outside this repository. It has to subscribe to `sensors/+/power` (new topic, same envelope as the other sensors) for the data to reach InfluxDB.
+
+---
+
+## Simulation mode and PC tools
+
+The board starts in **simulation mode** (`PM2200_SIM_DEFAULT` in `include/config.h`) because no meter is available yet: it publishes generated values flagged `simulated: true`. Switch **Data source** in the setup page to use a real meter; the choice is stored in NVS.
+
+`tools/pm2200_sim/` runs on a PC with plain Python 3 (standard library only; on Windows use `py`):
+
+```bash
+# Print the exact MQTT payload every 5 s
+python tools/pm2200_sim/sim_meter.py
+python tools/pm2200_sim/sim_meter.py --wh-start 5000 --interval 2
+
+# Preview the board's setup page with simulated data: http://localhost:8080
+python tools/pm2200_sim/webap_preview.py            # discovery page: http://localhost:8080/discover
+python tools/pm2200_sim/webap_preview.py --real-meter   # leave out values whose register is unknown
+
+# Self-checks
+python tools/pm2200_sim/sim_meter.py --check
+python tools/pm2200_sim/webap_preview.py --check
+```
+
+The preview serves the real HTML out of `src/web_server.cpp` and emulates the board's routes, so editing the page and refreshing the browser shows what the board will serve.
+
+---
+
+## Configuration (`include/config.h`)
+
+| Define | Purpose |
+|---|---|
+| `AP_SSID` | Hotspot name prefix (`PM2200_Hotspot`, plus the last 4 MAC characters) |
+| `FIRMWARE_VERSION` | Firmware version, shown in the page and the MQTT payload |
+| `RS485_TX_PIN`, `RS485_RX_PIN`, `RS485_DE_PIN` | RS485 pins |
+| `RS485_TIMEOUT_MS`, `RS485_POLL_INTERVAL`, `RS485_MAX_FAILS` | Transaction timeout (400 ms), poll interval (5 s), failures before `sensor_ok` goes false (3) |
+| `PM2200_ADDR_DEFAULT`, `PM2200_BAUD_DEFAULT`, `PM2200_PARITY_DEFAULT` | Meter settings used until they are saved from the page |
+| `PM2200_SIM_DEFAULT` | `true` = start in simulation mode |
+| `LOCAL_MQTT_SERVER`, `LOCAL_MQTT_PORT` | Default broker (`weedsync.local:1883`) |
+| `MDNS_PREFIX` | mDNS name prefix (`bossfarm`) |
+
+`include/pm2200_map.h` holds the PM2200 register table, the read blocks, the float word order and the address base.
+
+---
+
+## Build and flash
+
+```bash
+cp include/secrets.h.example include/secrets.h     # Windows: copy ...; then set AP_PASSWORD
+
+pio run -e esp32c6                                 # build
+pio run -e esp32c6 --target upload                 # flash
+pio device monitor --baud 115200                   # serial console (USB-CDC)
+```
+
+`include/secrets.h` is gitignored: keep real values out of git and never ship binaries built with real credentials. `HOME_SSID` and `HOME_PASSWORD` are only used if `DEV_MODE` is defined (it is not). The build uses the pioarduino platform (arduino-esp32 3.x) with the `huge_app.csv` partition table; see `platformio.ini`. Flash offsets: bootloader `0x0`, partitions `0x8000`, boot_app0 `0xe000`, application `0x10000`.
+
+The `flash_tool/` folder still holds the earlier project's flasher; see [Status](#status-and-known-limitations).
+
+---
+
+## Repository layout
+
+```
+src/
+  main.cpp              setup/loop, NeoPixel status, WiFi fallback, 5 s publish timer
+  local_mqtt.cpp        MQTT to the Pi broker: power payload, retained attributes
+  web_server.cpp        HTTP server, captive portal, setup and discovery pages, /power ...
+  wifi_config.cpp       WiFi credentials (NVS), connect, scan
+  factory_reset.cpp     GPIO5 hold detection, NVS reset
+  provisioning.cpp      legacy ThingsBoard provisioning (unused)
+  sensors/
+    rs485_sensor.cpp    Modbus RTU transport: UART1, DE/RE, CRC-16, FC 0x03
+    pm2200.cpp / .h     PM2200 driver: register decode, polling, simulation, settings
+include/                headers, config.h, pm2200_map.h (register table), secrets.h.example
+tools/pm2200_sim/       payload simulator and setup-page preview (Python)
+docs/                   payload contract, register map, PM2200 manual, proposal
+test/native/            native unit tests
+flash_tool/             flasher (still the earlier project's, see Status)
+```
+
+**NVS namespaces:** `netcfg` (WiFi `ssid`, `pass`), `device` (`commissioned`), `broker` (`host`, `port`), `pm2200` (`addr`, `baud`, `parity`, `sim`). A factory reset (hold GPIO5 for 5 s, or the page's button) clears the WiFi credentials and the commissioning flag; it keeps the broker address and the meter settings.
 
 ---
 
 ## Testing
 
-**Native unit tests** (no hardware required):
 ```bash
-pio test -e native
+pio test -e test        # native unit tests (WiFi credential validation, legacy provisioning parser)
 ```
 
-Covers: sensor validation, threshold logic, WiFi config validation, MQTT payload building, provisioning JSON parsing, AQI label mapping.
+The native tests need a host C/C++ compiler (gcc or clang). GitHub Actions (`.github/workflows/test.yml`) runs them and builds the firmware with `secrets.h.example`. The Python self-checks are listed under [Simulation mode and PC tools](#simulation-mode-and-pc-tools).
 
 ---
 
-## Known Limitations & Future Work
+## Documentation
 
-- **Soil & Mineral types:** Live via RS485 (Halisense Soil 7-in-1 / CWT-OYS-PHEC Water pH/EC)
-- **Provisioning:** Disabled by default, not actively maintained
-- **Buffer sizes:** MQTT payload 1024 bytes, log 40 lines — increase if needed
-- **I2C:** Single bus, single device (SCD40 only)
-- **Power:** Always-on AP draws ~100mA extra vs STA-only mode
-- **CO2 NVS key mismatch:** `loadThresholdsFromNVS` reads key `"eco2"` but `saveThresholdsToNVS` writes key `"co2"` — CO2 threshold resets to default (1000 ppm) after reboot. Pending fix.
+| File | Content |
+|---|---|
+| [docs/payload.md](docs/payload.md) | MQTT topics and payload contract, key table, units, rules |
+| [docs/pm2200_registers.md](docs/pm2200_registers.md) | Register map with verified / unverified status |
+| [docs/PM2200-datasheet.PDF](docs/PM2200-datasheet.PDF) | Schneider EasyLogic PM2200 user manual (NHA2778902-11) |
+| [docs/PM2200_proposal.md](docs/PM2200_proposal.md) | Implementation proposal |
 
 ---
 
-## Web AP Screenshots
+## Status and known limitations
 
-![Device Web UI Dashboard](assets/ui-dashboard.png)
-![Device Web UI Dashboard](assets/ui-discovery.png)
-
-## PCBA 3D
-![PCBA](assets/pcb3d.PNG)
-
-## Firmware Flash Tool GUI
-![Flash](assets/flashtool.PNG)
+- **Register addresses are unverified.** The PM2200 manual has no Modbus register map. The addresses in `include/pm2200_map.h` come from a third-party list for the same meter family; several are extrapolated. Schneider's "PM2000 series Modbus register list" (se.com) is needed to verify them.
+- **Some values cannot be read yet.** Neutral current, power factor, frequency, the three unbalance values and apparent energy (kVAh) have no known register address. On a real meter they are left out of the payload; in simulation all values are generated. The meter stores power factor on a -2 to +2 scale that has to be decoded once its register is known.
+- **Float word order and address base** are constants in `include/pm2200_map.h` (default: high word first, 0-based offsets). A wrong value shows up as rejected polls (`out-of-range value ... check word order / address base`) or as `meter_ok: false`.
+- **Simulation is the factory default.** Set `PM2200_SIM_DEFAULT` to `false` for builds that go on a real meter.
+- **No real-meter validation yet.** A bring-up checklist (meter settings, wiring, comparing the readings with the meter's display) is still to be written.
+- **Raspberry Pi side.** The bridge has to subscribe to `sensors/+/power`, and the dashboard design for the meter data is still to be agreed; both live outside this repository.
+- **Flasher.** `flash_tool/` still carries the previous project's branding and paths. The PM2200 flasher and its distributable bundle are the next step.
+- **Legacy code.** `src/provisioning.cpp` (ThingsBoard provisioning) is not used by this firmware.
