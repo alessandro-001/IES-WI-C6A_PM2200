@@ -6,12 +6,11 @@
 #include <WebServer.h>
 #include "config.h"
 #include "secrets.h"
-#include "sensors.h"
 #include "wifi_config.h"
 #include "provisioning.h"
-#include "mqtt.h"
 #include "local_mqtt.h"
 #include "rs485_sensor.h"
+#include "pm2200.h"
 #include <math.h>
 
 // ── Log buffer ────────────────────────────────────────────────────────────────
@@ -37,8 +36,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BOSS FARM — Device Setup</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
+  <title>BOSS FARM — Power Meter Setup</title>
   <style>
     :root {
       --bg:      #f9f7f3;
@@ -95,30 +93,32 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     .val { font-family: var(--mono); font-size: 1rem; font-weight: 600; color: var(--accent); word-break: break-all; }
     .val.small { font-size: 0.82rem; }
     
-    /* Sensor Grid */
-    .sensor-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
-    .sensor-tile { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 16px 12px; transition: all 0.2s; text-align: center; }
-    .sensor-tile:hover { border-color: var(--accent); background: rgba(45,93,63,0.03); }
-    .sensor-tile-label { font-family: var(--mono); font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; font-weight: 600; }
-    .sensor-tile-val { font-family: var(--mono); font-size: 1.25rem; font-weight: 700; color: var(--accent); }
-    .sensor-tile-val.light-on  { color: var(--yellow); }
-    .sensor-tile-val.light-off { color: var(--muted); }
-    .sensor-tile-val.aqi-1 { color: var(--green); }
-    .sensor-tile-val.aqi-2 { color: #5da86b; }
-    .sensor-tile-val.aqi-3 { color: var(--yellow); }
-    .sensor-tile-val.aqi-4 { color: #d4824d; }
-    .sensor-tile-val.aqi-5 { color: var(--red); }
-    
-    /* Chart Container */
-    .chart-container { position: relative; height: 300px; margin: 20px 0; padding: 0 12px; }
-    
-    /* Threshold Grid - Single Row */
-    .thresh-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; }
-    .thresh-item { display: flex; flex-direction: column; }
-    .thresh-item label { margin: 0 0 8px 0; }
-    .thresh-item input { width: 100%; }
-    .thresh-item.full { grid-column: 1 / -1; }
-    
+    /* Power meter: tiles, tables, charts, settings form */
+    .tile-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+    .tile { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 16px 12px; text-align: center; }
+    .tile-label { font-family: var(--mono); font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; font-weight: 600; }
+    .tile-val { font-family: var(--mono); font-size: 1.35rem; font-weight: 700; color: var(--accent); }
+    .tile-sub { font-family: var(--mono); font-size: 0.68rem; color: var(--muted); margin-top: 4px; }
+
+    .table-wrap { overflow-x: auto; margin-bottom: 20px; }
+    .mtable { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 0.85rem; }
+    .mtable th { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; text-align: right; padding: 8px 10px; border-bottom: 2px solid var(--border); white-space: nowrap; }
+    .mtable td { text-align: right; padding: 9px 10px; border-bottom: 1px solid var(--border); font-weight: 600; color: var(--accent); white-space: nowrap; }
+    .mtable th:first-child, .mtable td:first-child { text-align: left; }
+    .mtable td:first-child { color: var(--text); font-weight: 500; }
+    .mtable td.tot { background: rgba(45,93,63,0.05); }
+    .mtable small { display: block; color: var(--muted); font-size: 0.65rem; font-weight: 400; }
+
+    .chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .chart-title { font-family: var(--mono); font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; margin: 0 0 6px 0; font-weight: 600; }
+    .chart svg { width: 100%; height: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; display: block; }
+    .chart .axis { font: 10px 'Courier New', monospace; fill: var(--muted); }
+    .legend { font-family: var(--mono); font-size: 0.68rem; margin-top: 6px; display: flex; gap: 12px; flex-wrap: wrap; }
+
+    .form-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+    select { width: 100%; padding: 10px 12px; background: var(--bg); border: 1.5px solid var(--border); border-radius: 8px; color: var(--text); font-family: var(--mono); font-size: 0.95rem; outline: none; }
+    select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(45,93,63,0.1); }
+
     /* Button Styles */
     button { padding: 12px 16px; margin-top: 12px; border: none; border-radius: 8px; font-family: var(--sans); font-size: 0.95rem; font-weight: 700; cursor: pointer; letter-spacing: 0.02em; transition: all 0.15s; }
     button:active { transform: scale(0.98); }
@@ -153,22 +153,19 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     /* Responsive */
     @media (max-width: 1200px) {
       .row-2col { grid-template-columns: 1fr; }
-      .sensor-grid { grid-template-columns: repeat(4, 1fr); }
-      .thresh-grid { grid-template-columns: repeat(3, 1fr); }
     }
     @media (max-width: 768px) {
       body { padding: 20px 20px 40px; }
       .page-header h1 { font-size: 1.8rem; }
-      .sensor-grid { grid-template-columns: repeat(3, 1fr); }
-      .thresh-grid { grid-template-columns: repeat(2, 1fr); }
       .card { padding: 18px; }
+      .tile-grid, .form-grid { grid-template-columns: repeat(2, 1fr); }
+      .chart-row { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
       body { padding: 16px 12px 40px; }
       .page-header h1 { font-size: 1.5rem; }
       .page-header { padding-bottom: 16px; margin-bottom: 24px; }
-      .sensor-grid { grid-template-columns: repeat(2, 1fr); }
-      .thresh-grid { grid-template-columns: 1fr; }
+      .form-grid { grid-template-columns: 1fr; }
       .row-2col { grid-template-columns: 1fr; }
     }
   </style>
@@ -179,7 +176,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
   <div class="page-header">
     <div class="label">// device setup</div>
-    <h1>BOSS FARM <span>MONITOR</span></h1>
+    <h1>BOSS FARM <span>POWER METER</span></h1>
   </div>
 
   <!-- Device Info & WiFi Connection (Side by Side) -->
@@ -209,30 +206,6 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
       <div class="row">
         <span class="row-label">Signal</span>
         <span class="val" id="device-rssi">–</span>
-      </div>
-      <div class="row">
-        <span class="row-label">Sensor Type</span>
-        <span class="val" id="sensor-type-badge">–</span>
-      </div>
-      <div id="sensor-type-selector" class="row hidden" style="margin-top:8px;flex-direction:column;align-items:flex-start;">
-        <label style="margin-bottom:8px;">Select sensor type for this unit</label>
-        <div style="display:flex;gap:8px;width:100%;margin-bottom:8px;">
-          <button class="btn-wifi" style="flex:1;margin-top:0;padding:10px;" onclick="setSensorType(1)">Environment</button>
-          <button class="btn-wifi" style="flex:1;margin-top:0;padding:10px;" onclick="openSoilModelPopup()">Soil</button>
-          <button class="btn-wifi" style="flex:1;margin-top:0;padding:10px;" onclick="setSensorType(3)">Mineral</button>
-        </div>
-        <div id="sensor-type-selected" style="font-family:var(--mono);font-size:0.8rem;color:var(--muted);">None selected</div>
-      </div>
-
-      <!-- Soil model popup — asks which soil probe is wired before saving sensor_type=2 -->
-      <div id="soil-model-popup" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;display:flex;align-items:center;justify-content:center;">
-        <div style="background:var(--card-bg,#fff);border-radius:10px;padding:24px;max-width:360px;width:90%;">
-          <h3 style="margin-top:0;">Select Soil Probe</h3>
-          <p style="color:var(--muted);font-size:0.85rem;">Which soil sensor is wired to this unit?</p>
-          <button class="btn-wifi" style="width:100%;margin-top:8px;padding:10px;" onclick="confirmSoilModel(0)">🌱 Normal Soil (Halisense)</button>
-          <button class="btn-wifi" style="width:100%;margin-top:8px;padding:10px;" onclick="confirmSoilModel(1)">🧱 XS-MEC20 (VWC, EC and Temp Sensor)</button>
-          <button class="btn-wifi" style="width:100%;margin-top:8px;padding:10px;background:transparent;" onclick="closeSoilModelPopup()">Cancel</button>
-        </div>
       </div>
       <div class="row">
         <span class="row-label">Network Status</span>
@@ -268,153 +241,110 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
-  <!-- Live Sensor Data with Chart -->
-  <div class="card row-1col" id="step4">
+  <!-- Power Meter: live values -->
+  <div class="card row-1col" id="step-meter">
     <div class="card-header">
-      <span class="card-icon">📡</span>
-      <span class="card-title">Live Sensor Data</span>
+      <span class="card-icon">⚡</span>
+      <span class="card-title">Power Meter · PM2200</span>
+      <span class="badge waiting" id="meter-mode" style="margin-left:auto;">–</span>
+      <span class="badge waiting" id="meter-status">–</span>
     </div>
-    <div class="sensor-grid">
-      <div class="sensor-tile">
-        <div class="sensor-tile-label">🌡 Temperature</div>
-        <div class="sensor-tile-val" id="temp">–</div>
+    <div class="tile-grid">
+      <div class="tile">
+        <div class="tile-label">Active power</div>
+        <div class="tile-val" id="t-power">–</div>
+        <div class="tile-sub" id="t-power-sub">–</div>
       </div>
-      <div class="sensor-tile">
-        <div class="sensor-tile-label">💧 Humidity</div>
-        <div class="sensor-tile-val" id="hum">–</div>
+      <div class="tile">
+        <div class="tile-label">Energy delivered</div>
+        <div class="tile-val" id="t-energy">–</div>
+        <div class="tile-sub" id="t-energy-sub">–</div>
       </div>
-      <div class="sensor-tile">
-        <div class="sensor-tile-label">💡 Light</div>
-        <div class="sensor-tile-val" id="light">–</div>
+      <div class="tile">
+        <div class="tile-label">Power factor</div>
+        <div class="tile-val" id="t-pf">–</div>
       </div>
-      <div class="sensor-tile">
-        <div class="sensor-tile-label">💨 CO2</div>
-        <div class="sensor-tile-val" id="co2">– <span style="font-size:0.7rem;color:var(--muted);">ppm</span></div>
-      </div>
-      <div class="sensor-tile">
-        <div class="sensor-tile-label">📊 Air Quality</div>
-        <div class="sensor-tile-val" id="co2-label" style="color:var(--muted);">–</div>
+      <div class="tile">
+        <div class="tile-label">Frequency</div>
+        <div class="tile-val" id="t-freq">–</div>
       </div>
     </div>
-    <div class="chart-container">
-      <canvas id="sensorChart"></canvas>
+    <div class="table-wrap">
+      <table class="mtable">
+        <thead><tr><th>Instantaneous</th><th>L1</th><th>L2</th><th>L3</th><th>Total / Avg</th></tr></thead>
+        <tbody id="meter-rows"></tbody>
+      </table>
+    </div>
+    <div class="table-wrap">
+      <table class="mtable">
+        <thead><tr><th>Energy (cumulative)</th><th>Delivered</th><th>Received</th></tr></thead>
+        <tbody id="energy-rows"></tbody>
+      </table>
+    </div>
+    <div class="chart-row">
+      <div class="chart">
+        <div class="chart-title">Active power (kW)</div>
+        <svg id="chart-power" viewBox="0 0 600 150"></svg>
+        <div class="legend"><span style="color:#2d5d3f">■ Total</span><span style="color:#4a7fb5">■ L1</span><span style="color:#d4a137">■ L2</span><span style="color:#c94c4c">■ L3</span></div>
+      </div>
+      <div class="chart">
+        <div class="chart-title">Current (A)</div>
+        <svg id="chart-current" viewBox="0 0 600 150"></svg>
+        <div class="legend"><span style="color:#4a7fb5">■ L1</span><span style="color:#d4a137">■ L2</span><span style="color:#c94c4c">■ L3</span></div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:16px;">
+      <span class="row-label">Quality</span>
+      <span class="val small" id="m-quality">–</span>
+    </div>
+    <div class="row">
+      <span class="row-label">Last update</span>
+      <span class="val small" id="m-updated">–</span>
     </div>
   </div>
 
-  <!-- Alert Thresholds (Single Row) -->
-  <div class="card row-1col" id="step-thresh">
+  <!-- Power Meter: Modbus settings -->
+  <div class="card row-1col" id="step-modbus">
     <div class="card-header">
-      <span class="card-icon">⚠️</span>
-      <span class="card-title">Alert Thresholds</span>
+      <span class="card-icon">🔧</span>
+      <span class="card-title">Meter Settings · Modbus RTU</span>
     </div>
-    <div class="thresh-grid">
-      <div class="thresh-item">
-        <label>🌡 Temp Offset (°C)</label>
-        <input type="number" id="thresh-temp-offset" step="0.1" min="-20" max="20" placeholder="0.0">
+    <div class="form-grid">
+      <div>
+        <label>Slave address (1–247)</label>
+        <input type="number" id="m-addr" min="1" max="247" step="1">
       </div>
-      <div class="thresh-item">
-        <label>🌡 Max Temp (°C)</label>
-        <input type="number" id="thresh-temp" step="0.5" min="-40" max="125" placeholder="30">
+      <div>
+        <label>Baud rate</label>
+        <select id="m-baud">
+          <option value="4800">4800</option>
+          <option value="9600">9600</option>
+          <option value="19200">19200</option>
+          <option value="38400">38400</option>
+        </select>
       </div>
-      <div class="thresh-item">
-        <label>💧 Humidity Offset (%)</label>
-        <input type="number" id="thresh-hum-offset" step="0.1" min="-50" max="50" placeholder="0.0">
+      <div>
+        <label>Parity</label>
+        <select id="m-parity">
+          <option value="E">Even (1 stop bit)</option>
+          <option value="O">Odd (1 stop bit)</option>
+          <option value="N">None (2 stop bits)</option>
+        </select>
       </div>
-      <div class="thresh-item">
-        <label>💧 Min Humidity (%)</label>
-        <input type="number" id="thresh-hum-low" step="1" min="0" max="100" placeholder="20">
-      </div>
-      <div class="thresh-item">
-        <label>💧 Max Humidity (%)</label>
-        <input type="number" id="thresh-hum" step="1" min="0" max="100" placeholder="80">
-      </div>
-      <div class="thresh-item">
-        <label>💨 CO2 Offset (ppm)</label>
-        <input type="number" id="thresh-co2-offset" step="10" min="-5000" max="5000" placeholder="0">
-      </div>
-      <div class="thresh-item">
-        <label>💨 Max CO2 (ppm)</label>
-        <input type="number" id="thresh-co2" step="50" min="400" max="40000" placeholder="1000">
-      </div>
-      <div class="thresh-item">
-        <label>💡 Light Threshold (0–4095)</label>
-        <input type="number" id="thresh-ldr-thresh" step="1" min="0" max="4095" placeholder="50">
+      <div>
+        <label>Data source</label>
+        <select id="m-sim">
+          <option value="0">PM2200 meter (RS485)</option>
+          <option value="1">Simulated (no meter)</option>
+        </select>
       </div>
     </div>
-    <button class="btn-save" onclick="saveThresholds()">💾 Save Thresholds</button>
-  </div>
-
-    <!-- ══════════ SOIL SECTION (sensor type 2, Halisense or XS-MEC20) ══════════ -->
-  <div class="card row-1col hidden" id="card-soil">
-    <div class="card-header">
-      <span class="card-icon">🌱</span>
-      <span class="card-title">Soil Sensor (RS485)</span>
-      <span class="badge" id="soil-model-badge" style="margin-left:8px;">–</span>
-      <span class="badge waiting" id="soil-status" style="margin-left:auto;">–</span>
+    <button class="btn-save" onclick="saveMeter()">💾 Save Meter Settings</button>
+    <div class="row" style="margin-top:12px;">
+      <span class="row-label" style="color:var(--muted);font-size:0.8rem;">
+        Match address, baud rate and parity to the meter's front panel (Comm setup). Simulated data is flagged as simulated when published.
+      </span>
     </div>
-    <div class="sensor-grid" style="grid-template-columns:repeat(7,1fr);">
-      <div class="sensor-tile"><div class="sensor-tile-label">💧 Moisture</div>
-        <div class="sensor-tile-val" id="soil-moist">– <span style="font-size:0.7rem;color:var(--muted);">%</span></div></div>
-      <div class="sensor-tile"><div class="sensor-tile-label">🌡 Soil Temp</div>
-        <div class="sensor-tile-val" id="soil-temp">– <span style="font-size:0.7rem;color:var(--muted);">°C</span></div></div>
-      <div class="sensor-tile"><div class="sensor-tile-label">⚡ Soil EC</div>
-        <div class="sensor-tile-val" id="soil-ec">– <span style="font-size:0.7rem;color:var(--muted);">uS/cm</span></div></div>
-      <div class="sensor-tile npk-tile"><div class="sensor-tile-label">🧪 Soil pH</div>
-        <div class="sensor-tile-val" id="soil-ph">–</div></div>
-      <div class="sensor-tile npk-tile"><div class="sensor-tile-label">N</div>
-        <div class="sensor-tile-val" id="soil-n">– <span style="font-size:0.7rem;color:var(--muted);">mg/kg</span></div></div>
-      <div class="sensor-tile npk-tile"><div class="sensor-tile-label">P</div>
-        <div class="sensor-tile-val" id="soil-p">– <span style="font-size:0.7rem;color:var(--muted);">mg/kg</span></div></div>
-      <div class="sensor-tile npk-tile"><div class="sensor-tile-label">K</div>
-        <div class="sensor-tile-val" id="soil-k">– <span style="font-size:0.7rem;color:var(--muted);">mg/kg</span></div></div>
-    </div>
-    <div class="chart-container"><canvas id="soilChart"></canvas></div>
-    <div class="card-header" style="margin-top:8px;">
-      <span class="card-icon">⚠️</span><span class="card-title">Soil Alert Thresholds</span>
-    </div>
-    <div class="thresh-grid">
-      <div class="thresh-item"><label>💧 Min Moisture (%)</label>
-        <input type="number" id="th-smoist-low" step="1" min="0" max="100"></div>
-      <div class="thresh-item"><label>💧 Max Moisture (%)</label>
-        <input type="number" id="th-smoist-high" step="1" min="0" max="100"></div>
-      <div class="thresh-item"><label>⚡ Max EC (uS/cm)</label>
-        <input type="number" id="th-sec-high" step="50" min="0" max="20000"></div>
-      <div class="thresh-item npk-tile"><label>🧪 Min pH</label>
-        <input type="number" id="th-sph-low" step="0.1" min="0" max="14"></div>
-      <div class="thresh-item npk-tile"><label>🧪 Max pH</label>
-        <input type="number" id="th-sph-high" step="0.1" min="0" max="14"></div>
-    </div>
-    <button class="btn-save" onclick="saveSoilThresh()">💾 Save Soil Thresholds</button>
-  </div>
-
-  <!-- ══════════ WATER pH/EC SECTION (sensor type 3 / mineral) ══════════ -->
-  <div class="card row-1col hidden" id="card-water">
-    <div class="card-header">
-      <span class="card-icon">💦</span>
-      <span class="card-title">Water pH + EC Sensor (RS485)</span>
-      <span class="badge waiting" id="water-status" style="margin-left:auto;">–</span>
-    </div>
-    <div class="sensor-grid" style="grid-template-columns:repeat(3,1fr);">
-      <div class="sensor-tile"><div class="sensor-tile-label">🧪 Water pH</div>
-        <div class="sensor-tile-val" id="water-ph">–</div></div>
-      <div class="sensor-tile"><div class="sensor-tile-label">⚡ Water EC</div>
-        <div class="sensor-tile-val" id="water-ec">– <span style="font-size:0.7rem;color:var(--muted);">uS/cm</span></div></div>
-      <div class="sensor-tile"><div class="sensor-tile-label">🌡 Water Temp</div>
-        <div class="sensor-tile-val" id="water-temp">– <span style="font-size:0.7rem;color:var(--muted);">°C</span></div></div>
-    </div>
-    <div class="chart-container"><canvas id="waterChart"></canvas></div>
-    <div class="card-header" style="margin-top:8px;">
-      <span class="card-icon">⚠️</span><span class="card-title">Water Alert Thresholds</span>
-    </div>
-    <div class="thresh-grid" style="grid-template-columns:repeat(3,1fr);">
-      <div class="thresh-item"><label>🧪 Min pH</label>
-        <input type="number" id="th-wph-low" step="0.1" min="0" max="14"></div>
-      <div class="thresh-item"><label>🧪 Max pH</label>
-        <input type="number" id="th-wph-high" step="0.1" min="0" max="14"></div>
-      <div class="thresh-item"><label>⚡ Max EC (uS/cm)</label>
-        <input type="number" id="th-wec-high" step="50" min="0" max="20000"></div>
-    </div>
-    <button class="btn-save" onclick="saveWaterThresh()">💾 Save Water Thresholds</button>
   </div>
 
   <!-- Device Log Terminal -->
@@ -445,324 +375,22 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
 <!-- ============================================================================
      SCRIPT SECTION
-     
-     Location guide for your C++ backend:
-     
-     1. ALL DEVICE CONTROL LOGIC (lines below) runs client-side
-     2. API endpoints being called: /device_info, /wifi, /sensors, /logs, 
-        /get_thresh, /set_thresh, /scan, /set_wifi, /factory_reset, 
-        /get_sensor_type, /set_sensor_type
-     3. CHART FUNCTIONS (initChart, updateChart): Called automatically when 
-        sensor data updates. Called in pollSensors() at ~line 400
-     4. Add to your C++ the following endpoints if not already present:
-        - GET /device_info → JSON with device_id, firmware, mdns, ip, rssi, commissioned
-        - GET /sensors → JSON with temp, hum, ldr_ok, light_on, scd40_ok, co2, co2_label
-        - GET /wifi → JSON with ssid, connected
-        - GET /logs → JSON with seq, lines[]
-        - GET /get_thresh → JSON with temp, temp_low, hum, hum_low, co2
-        - POST /set_thresh → accepts temp, temp_low, hum, hum_low, co2 params
-        - GET /scan → JSON with array of {ssid, rssi, secure}
-        - POST /set_wifi → accepts ssid, pass, secure; returns {ok, ip, mdns, msg}
-        - POST /factory_reset → triggers reset
-        - GET /get_sensor_type → JSON with sensor_type (1,2,3)
-        - POST /set_sensor_type → accepts type param
-     
+
+     API endpoints called (all registered in webServerInit()):
+        GET  /device_info  -> device_id, firmware, mdns, ip, rssi, commissioned
+        GET  /wifi         -> ssid, connected
+        GET  /logs         -> seq, lines[]
+        GET  /scan         -> array of {ssid, rssi, secure}
+        POST /set_wifi     -> accepts ssid, pass, secure; returns {ok, ip, mdns, msg}
+        POST /factory_reset
      ============================================================================ -->
 
 <script>
-// ═══════════════════════════════════════════════════════════════════════════
-// CHART INITIALIZATION & UPDATE (for sensor data visualization)
-// ═══════════════════════════════════════════════════════════════════════════
-
-let sensorChart = null;
-let chartData = {
-  temp: [],
-  humidity: [],
-  co2: [],
-  timestamps: []
-};
-
-function initChart() {
-  const ctx = document.getElementById('sensorChart');
-  if (!ctx) return;
-  
-  sensorChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: chartData.timestamps,
-      datasets: [
-        {
-          label: 'Temperature (°C)',
-          data: chartData.temp,
-          borderColor: '#2d5d3f',
-          backgroundColor: 'rgba(45,93,63,0.1)',
-          tension: 0.3,
-          fill: false,
-          borderWidth: 2,
-          pointRadius: 4,
-          pointBackgroundColor: '#2d5d3f'
-        },
-        {
-          label: 'Humidity (%)',
-          data: chartData.humidity,
-          borderColor: '#d4a137',
-          backgroundColor: 'rgba(212,161,55,0.1)',
-          tension: 0.3,
-          fill: false,
-          borderWidth: 2,
-          pointRadius: 4,
-          pointBackgroundColor: '#d4a137'
-        },
-        {
-          label: 'CO₂ (ppm/10)',
-          data: chartData.co2,
-          borderColor: '#c94c4c',
-          backgroundColor: 'rgba(201,76,76,0.1)',
-          tension: 0.3,
-          fill: false,
-          borderWidth: 2,
-          pointRadius: 4,
-          pointBackgroundColor: '#c94c4c'
-        }
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: {
-          display: true,
-          labels: {
-            color: '#3d3a36',
-            font: { family: "'Courier New', monospace", size: 12 },
-            usePointStyle: true,
-            padding: 15
-          }
-        },
-        filler: { propagate: true }
-      },
-      scales: {
-        y: {
-          beginAtZero: false,
-          ticks: { color: '#8b8680', font: { size: 11 } },
-          grid: { color: 'rgba(232,228,220,0.3)' }
-        },
-        x: {
-          ticks: { color: '#8b8680', font: { size: 11 } },
-          grid: { color: 'rgba(232,228,220,0.3)' }
-        }
-      }
-    }
-  });
-}
-
-function updateChart(temp, humidity, co2) {
-  if (!sensorChart) {
-    initChart();
-    return;
-  }
-  
-  const now = new Date().toLocaleTimeString();
-  chartData.timestamps.push(now);
-  chartData.temp.push(typeof temp === 'number' ? temp : null);
-  chartData.humidity.push(typeof humidity === 'number' ? humidity : null);
-  chartData.co2.push(typeof co2 === 'number' ? co2/10 : null);
-  
-  // Keep only last 30 data points
-  if (chartData.timestamps.length > 30) {
-    chartData.timestamps.shift();
-    chartData.temp.shift();
-    chartData.humidity.shift();
-    chartData.co2.shift();
-  }
-  
-  sensorChart.update('none');
-}
-
-// ── RS485 charts ───────────────────────────────────────────────────────────
-function makeLineChart(canvasId, datasets) {
-  return new Chart(document.getElementById(canvasId), {
-    type: 'line',
-    data: { labels: [], datasets: datasets.map(d => ({
-      label: d.label, data: [], borderColor: d.color,
-      tension: 0.3, fill: false, borderWidth: 2, pointRadius: 3,
-      pointBackgroundColor: d.color })) },
-    options: { responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: true, labels: { color: '#3d3a36',
-        font: { family: "'Courier New', monospace", size: 12 },
-        usePointStyle: true, padding: 15 } } },
-      scales: { y: { ticks: { color: '#8b8680', font: { size: 11 } },
-                     grid: { color: 'rgba(232,228,220,0.3)' } },
-                x: { ticks: { color: '#8b8680', font: { size: 11 } },
-                     grid: { color: 'rgba(232,228,220,0.3)' } } } }
-  });
-}
-function pushChart(chart, values) {
-  chart.data.labels.push(new Date().toLocaleTimeString());
-  values.forEach((v, i) => chart.data.datasets[i].data.push(v));
-  if (chart.data.labels.length > 30) {
-    chart.data.labels.shift();
-    chart.data.datasets.forEach(ds => ds.data.shift());
-  }
-  chart.update('none');
-}
-
-let soilChart = null, waterChart = null, currentSensorType = 1, currentSoilModel = 0;
-
-function setTile(id, val, digits, alert) {
-  const el = document.getElementById(id);
-  if (val == null) { el.firstChild.textContent = '– '; el.style.color = 'var(--muted)'; return; }
-  el.firstChild.textContent = Number(val).toFixed(digits) + ' ';
-  el.style.color = alert ? 'var(--red)' : '';
-}
-function setStatusBadge(id, ok) {
-  document.getElementById(id).outerHTML =
-    '<span class="badge ' + (ok ? 'online' : 'offline') + '" id="' + id +
-    '" style="margin-left:auto;">' + (ok ? '● Sensor OK' : '● No response') + '</span>';
-}
-
-function updateRs485Ui(d) {
-  if (currentSensorType === 2) {
-    setStatusBadge('soil-status', d.soil_ok);
-    setTile('soil-moist', d.soil_ok ? d.soil_moist : null, 1, d.alert_soil_moist);
-    setTile('soil-temp',  d.soil_ok ? d.soil_temp  : null, 1, false);
-    setTile('soil-ec',    d.soil_ok ? d.soil_ec    : null, 0, d.alert_soil_ec);
-    const series  = [d.soil_moist, d.soil_temp, d.soil_ec / 100];
-    const labels  = [{ label: 'Moisture (%)', color: '#2d5d3f' },
-                      { label: 'Temp (°C)',     color: '#d4a137' },
-                      { label: 'EC (uS/cm ÷100)', color: '#c94c4c' }];
-    if (currentSoilModel === 0) {   // Halisense — pH/NPK meaningful
-      setTile('soil-ph', d.soil_ok ? d.soil_ph : null, 1, d.alert_soil_ph);
-      setTile('soil-n',  d.soil_ok ? d.soil_n  : null, 0, false);
-      setTile('soil-p',  d.soil_ok ? d.soil_p  : null, 0, false);
-      setTile('soil-k',  d.soil_ok ? d.soil_k  : null, 0, false);
-      series.push(d.soil_ph);
-      labels.push({ label: 'pH', color: '#4a7fb5' });
-    }
-    if (d.soil_ok) {
-      if (!soilChart) soilChart = makeLineChart('soilChart', labels);
-      pushChart(soilChart, series);
-    }
-  } else if (currentSensorType === 3) {
-    setStatusBadge('water-status', d.water_ok);
-    setTile('water-ph',   d.water_ok ? d.water_ph   : null, 2, d.alert_water_ph);
-    setTile('water-ec',   d.water_ok ? d.water_ec   : null, 0, d.alert_water_ec);
-    setTile('water-temp', d.water_ok ? d.water_temp : null, 1, false);
-    if (d.water_ok) {
-      if (!waterChart) waterChart = makeLineChart('waterChart', [
-        { label: 'pH',            color: '#4a7fb5' },
-        { label: 'EC (uS/cm ÷100)', color: '#c94c4c' },
-        { label: 'Temp (°C)',     color: '#d4a137' }]);
-      pushChart(waterChart, [d.water_ph, d.water_ec / 100, d.water_temp]);
-    }
-  }
-}
-
-function applySensorTypeVisibility(t) {
-  currentSensorType = t;
-  document.getElementById('step4').classList.toggle('hidden', t !== 1);
-  document.getElementById('step-thresh').classList.toggle('hidden', t !== 1);
-  document.getElementById('card-soil').classList.toggle('hidden', t !== 2);
-  document.getElementById('card-water').classList.toggle('hidden', t !== 3);
-}
-
-const SOIL_MODEL_LABELS = { 0: 'Normal Soil (Halisense)', 1: 'Substrate Sensor (XS-MEC20)' };
-
-// Additive to applySensorTypeVisibility — only touches the pH/NPK tiles
-// inside card-soil, never the step4/step-thresh/card-soil/card-water
-// visibility that sensor_type (1/2/3) already controls.
-function applySoilModelVisibility(m) {
-  currentSoilModel = m;
-  document.querySelectorAll('#card-soil .npk-tile').forEach(function(el) {
-    el.classList.toggle('hidden', m !== 0);
-  });
-  document.getElementById('soil-model-badge').textContent = SOIL_MODEL_LABELS[m] || '–';
-  soilChart = null;   // series count differs (Halisense adds pH) — rebuild on next update
-}
-
-function loadSoilModel() {
-  fetch('/get_soil_model').then(r => r.json()).then(d => {
-    applySoilModelVisibility(d.soil_model);
-  }).catch(() => {});
-}
-
-// ── RS485 thresholds ──────────────────────────────────────────────────────
-function loadRs485Thresh() {
-  fetch('/get_rs485_thresh').then(r => r.json()).then(th => {
-    document.getElementById('th-wph-low').value     = th.wph_low;
-    document.getElementById('th-wph-high').value    = th.wph_high;
-    document.getElementById('th-wec-high').value    = th.wec_high;
-    document.getElementById('th-smoist-low').value  = th.smoist_low;
-    document.getElementById('th-smoist-high').value = th.smoist_high;
-    document.getElementById('th-sec-high').value    = th.sec_high;
-    document.getElementById('th-sph-low').value     = th.sph_low;
-    document.getElementById('th-sph-high').value    = th.sph_high;
-  }).catch(() => {});
-}
-function saveSoilThresh() {
-  const lo = parseFloat(document.getElementById('th-smoist-low').value);
-  const hi = parseFloat(document.getElementById('th-smoist-high').value);
-  const ec = parseFloat(document.getElementById('th-sec-high').value);
-  const pl = parseFloat(document.getElementById('th-sph-low').value);
-  const ph = parseFloat(document.getElementById('th-sph-high').value);
-  if ([lo, hi, ec, pl, ph].some(isNaN)) { showMsg('Enter valid values', 'error'); return; }
-  if (lo >= hi) { showMsg('Min moisture must be lower than max', 'error'); return; }
-  if (pl >= ph) { showMsg('Min pH must be lower than max', 'error'); return; }
-  fetch('/set_rs485_thresh?smoist_low=' + lo + '&smoist_high=' + hi +
-        '&sec_high=' + ec + '&sph_low=' + pl + '&sph_high=' + ph)
-    .then(() => showMsg('✓ Soil thresholds saved!', 'success'))
-    .catch(() => showMsg('Failed to save', 'error'));
-}
-function saveWaterThresh() {
-  const pl = parseFloat(document.getElementById('th-wph-low').value);
-  const ph = parseFloat(document.getElementById('th-wph-high').value);
-  const ec = parseFloat(document.getElementById('th-wec-high').value);
-  if ([pl, ph, ec].some(isNaN)) { showMsg('Enter valid values', 'error'); return; }
-  if (pl >= ph) { showMsg('Min pH must be lower than max', 'error'); return; }
-  fetch('/set_rs485_thresh?wph_low=' + pl + '&wph_high=' + ph + '&wec_high=' + ec)
-    .then(() => showMsg('✓ Water thresholds saved!', 'success'))
-    .catch(() => showMsg('Failed to save', 'error'));
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // DEVICE CONTROL FUNCTIONS (existing logic - do not modify)
 // ═══════════════════════════════════════════════════════════════════════════
 
 let selectedSecure = false;
-
-function loadThresholds() {
-  fetch('/get_thresh').then(r => r.json()).then(th => {
-    document.getElementById('thresh-temp').value        = th.temp;
-    document.getElementById('thresh-temp-offset').value = th.temp_offset || 0;
-    document.getElementById('thresh-hum-offset').value  = th.hum_offset !== undefined ? th.hum_offset : 0;
-    document.getElementById('thresh-hum').value         = th.hum;
-    document.getElementById('thresh-hum-low').value     = th.hum_low;
-    document.getElementById('thresh-co2-offset').value  = th.co2_offset !== undefined ? th.co2_offset : 0;
-    document.getElementById('thresh-co2').value         = th.co2;
-    document.getElementById('thresh-ldr-thresh').value  = th.ldr_thresh !== undefined ? th.ldr_thresh : 50;
-  });
-}
-
-function saveThresholds() {
-  const temp      = parseFloat(document.getElementById('thresh-temp').value);
-  const offset    = parseFloat(document.getElementById('thresh-temp-offset').value) || 0;
-  const humOff    = parseFloat(document.getElementById('thresh-hum-offset').value) || 0;
-  const hum       = parseFloat(document.getElementById('thresh-hum').value);
-  const humLow    = parseFloat(document.getElementById('thresh-hum-low').value);
-  const co2Off    = parseFloat(document.getElementById('thresh-co2-offset').value) || 0;
-  const co2       = parseFloat(document.getElementById('thresh-co2').value);
-  const ldrThr    = parseInt(document.getElementById('thresh-ldr-thresh').value);
-  if ([temp, hum, humLow, co2].some(isNaN)) { showMsg('Enter valid values for all thresholds', 'error'); return; }
-  if (humLow >= hum) { showMsg('Min Humidity must be lower than Max Humidity', 'error'); return; }
-  const ldrVal = isNaN(ldrThr) ? 50 : Math.max(0, Math.min(4095, ldrThr));
-  showMsg('Saving thresholds...', 'info');
-  fetch('/set_thresh?temp=' + temp + '&hum=' + hum + '&hum_low=' + humLow + '&co2=' + co2 +
-        '&temp_offset=' + offset + '&hum_offset=' + humOff + '&co2_offset=' + co2Off +
-        '&ldr_thresh=' + ldrVal)
-    .then(r => r.text())
-    .then(() => showMsg('✓ Thresholds saved!', 'success'))
-    .catch(() => showMsg('Failed to save', 'error'));
-}
 
 function scanWifi() {
   const nets = document.getElementById('networks');
@@ -855,83 +483,7 @@ function updateStatus() {
     } else {
       statusEl.innerHTML = '<span class="badge offline">● Offline</span>';
     }
-
-    loadSensorType();
-    document.getElementById('sensor-type-selector').classList.toggle('hidden', !!info.commissioned);
   }).catch(() => {});
-}
-
-function pollSensors() {
-  fetch('/sensors').then(r => r.json()).then(d => {
-    const tempEl      = document.getElementById('temp');
-    const humEl       = document.getElementById('hum');
-    const lightEl     = document.getElementById('light');
-    const co2El       = document.getElementById('co2');
-    const co2LabelEl  = document.getElementById('co2-label');
-
-    // Temperature
-    if (d.temp != null) {
-      tempEl.textContent = d.temp.toFixed(1);
-      tempEl.style.color = '';
-    } else {
-      tempEl.textContent = '–';
-      tempEl.style.color = 'var(--muted)';
-    }
-
-    // Humidity
-    if (d.hum != null) {
-      humEl.textContent = d.hum.toFixed(1);
-      humEl.style.color = '';
-    } else {
-      humEl.textContent = '–';
-      humEl.style.color = 'var(--muted)';
-    }
-
-    // Light / LDR
-    if (d.ldr_ok) {
-      lightEl.textContent = d.light_on ? 'ON' : 'OFF';
-      lightEl.className = 'sensor-tile-val ' + (d.light_on ? 'light-on' : 'light-off');
-      lightEl.style.color = '';
-    } else {
-      lightEl.textContent = 'N/A';
-      lightEl.className = 'sensor-tile-val';
-      lightEl.style.color = 'var(--muted)';
-    }
-
-    // CO2 / SCD40
-    if (d.scd40_ok) {
-      if (d.co2 != null && d.co2 >= 400) {
-        co2El.innerHTML = d.co2 + ' <span style="font-size:0.7rem;color:var(--muted);">ppm</span>';
-        co2LabelEl.textContent = d.co2_label || '–';
-        co2LabelEl.style.color = d.co2 < 1000 ? '#2d5d3f' : d.co2 < 1500 ? '#d4a137' : '#c94c4c';
-        co2El.style.color = '';
-      } else if (d.co2 === 0 || d.co2 == null) {
-        co2El.textContent = 'Warming up';
-        co2El.style.color = 'var(--muted)';
-        co2LabelEl.textContent = '';
-        co2LabelEl.style.color = 'var(--muted)';
-      } else {
-        co2El.textContent = 'N/A';
-        co2El.style.color = 'var(--muted)';
-        co2LabelEl.textContent = '';
-        co2LabelEl.style.color = 'var(--muted)';
-      }
-    } else {
-      co2El.textContent = 'N/A';
-      co2El.style.color = 'var(--muted)';
-      co2LabelEl.textContent = '';
-      co2LabelEl.style.color = 'var(--muted)';
-    }
-
-    // Update chart with latest sensor values
-    if (d.temp != null || d.hum != null || d.co2 != null) {
-      updateChart(d.temp, d.hum, d.co2);
-    }
-
-    if (d.sensor_type) currentSensorType = d.sensor_type;
-    updateRs485Ui(d);
-
-  }).catch(err => { console.error('pollSensors error', err); });
 }
 
 function showMsg(txt, type) {
@@ -960,77 +512,149 @@ function pollLogs() {
   }).catch(() => {});
 }
 
-const SENSOR_LABELS = { 1: 'Environment', 2: 'Soil', 3: 'Mineral' };
+// ═══════════════════════════════════════════════════════════════════════════
+// POWER METER (PM2200) — values come from GET /power, same keys as the MQTT payload
+// ═══════════════════════════════════════════════════════════════════════════
 
-function loadSensorType() {
-  fetch('/get_sensor_type').then(r => r.json()).then(d => {
-    const label = SENSOR_LABELS[d.sensor_type] || '–';
-    document.getElementById('sensor-type-badge').textContent = label;
-    applySensorTypeVisibility(d.sensor_type);
+// Table layout: label, payload keys for L1 / L2 / L3 / Total-Avg, decimals, divisor (W -> kW)
+const ROWS = [
+  { label: 'Voltage L-N (V)',       keys: ['v1', 'v2', 'v3', 'v_avg'],       d: 1 },
+  { label: 'Voltage L-L (V)',       keys: ['v12', 'v23', 'v31', 'vll_avg'],  d: 1, sub: 'L1-L2 · L2-L3 · L3-L1' },
+  { label: 'Current (A)',           keys: ['i1', 'i2', 'i3', 'i_avg'],       d: 2 },
+  { label: 'Neutral current (A)',   keys: [null, null, null, 'i_n'],        d: 2 },
+  { label: 'Active power (kW)',     keys: ['p1', 'p2', 'p3', 'p_total_w'],   d: 2, k: 1000 },
+  { label: 'Reactive power (kvar)', keys: ['q1', 'q2', 'q3', 'q_total_var'], d: 2, k: 1000 },
+  { label: 'Apparent power (kVA)',  keys: ['s1', 's2', 's3', 's_total_va'],  d: 2, k: 1000 },
+  { label: 'Power factor',          keys: ['pf1', 'pf2', 'pf3', 'pf'],       d: 2 }
+];
+// Energy table: label, [delivered key, received key] (Wh -> kWh)
+const ENERGY = [
+  { label: 'Active (kWh)',     keys: ['energy_wh', 'energy_wh_recv'] },
+  { label: 'Reactive (kvarh)', keys: ['energy_varh', 'energy_varh_recv'] },
+  { label: 'Apparent (kVAh)',  keys: ['energy_vah', 'energy_vah_recv'] }
+];
+const HIST_N = 60;   // samples kept in the charts (one per meter poll)
+const hist = { pt: [], p1: [], p2: [], p3: [], i1: [], i2: [], i3: [] };
+let lastPoll = -1;
+
+// A key the board does not send (never read / register address not known yet) shows as a dash.
+function fmt(v, d, k) { return (v == null || isNaN(v)) ? '–' : (v / (k || 1)).toFixed(d); }
+function withUnit(s, u) { return s === '–' ? s : s + ' ' + u; }
+function setText(id, txt) { document.getElementById(id).textContent = txt; }
+function setBadge(id, cls, txt) {
+  const el = document.getElementById(id);
+  el.className = 'badge ' + cls;
+  el.textContent = txt;
+}
+function pushHist(arr, v) {
+  if (v == null || isNaN(v)) return;
+  arr.push(v);
+  if (arr.length > HIST_N) arr.shift();
+}
+
+function drawChart(id, series, colors) {
+  const W = 600, H = 150, P = 8;
+  let lo = Infinity, hi = -Infinity;
+  series.forEach(s => s.forEach(v => { if (v < lo) lo = v; if (v > hi) hi = v; }));
+  if (!isFinite(lo)) return;
+  if (hi - lo < 0.01) { lo -= 0.5; hi += 0.5; }
+  const x = i => (i / (HIST_N - 1) * W).toFixed(1);
+  const y = v => (H - P - (v - lo) / (hi - lo) * (H - 2 * P)).toFixed(1);
+  document.getElementById(id).innerHTML =
+    series.map((s, k) => s.length < 2 ? '' :
+      '<polyline fill="none" stroke="' + colors[k] + '" stroke-width="' + (k === 0 && series.length > 3 ? 3 : 2) +
+      '" stroke-linejoin="round" points="' + s.map((v, i) => x(i) + ',' + y(v)).join(' ') + '"/>').join('') +
+    '<text class="axis" x="6" y="14">' + hi.toFixed(2) + '</text>' +
+    '<text class="axis" x="6" y="' + (H - 6) + '">' + lo.toFixed(2) + '</text>';
+}
+
+function renderMeter(d) {
+  setBadge('meter-mode', d.simulated ? 'waiting' : 'online', d.simulated ? 'SIMULATED' : 'PM2200 METER');
+  setBadge('meter-status', d.meter_ok ? 'online' : 'offline', d.meter_ok ? '● Reading OK' : '● No response');
+
+  setText('t-power', withUnit(fmt(d.p_total_w, 2, 1000), 'kW'));
+  setText('t-power-sub', 'S ' + withUnit(fmt(d.s_total_va, 2, 1000), 'kVA') + ' · Q ' + withUnit(fmt(d.q_total_var, 2, 1000), 'kvar'));
+  setText('t-energy', d.energy_wh == null ? '–' : Math.round(d.energy_wh).toLocaleString('en-US') + ' Wh');
+  setText('t-energy-sub', withUnit(fmt(d.energy_wh, 2, 1000), 'kWh'));
+  setText('t-pf', fmt(d.pf, 2));
+  setText('t-freq', withUnit(fmt(d.freq_hz, 2), 'Hz'));
+
+  document.getElementById('meter-rows').innerHTML = ROWS.map(r =>
+    '<tr><td>' + r.label + (r.sub ? '<small>' + r.sub + '</small>' : '') + '</td>' +
+    r.keys.map((key, i) => '<td' + (i === 3 ? ' class="tot"' : '') + '>' + (key ? fmt(d[key], r.d, r.k) : '') + '</td>').join('') +
+    '</tr>').join('');
+  document.getElementById('energy-rows').innerHTML = ENERGY.map(r =>
+    '<tr><td>' + r.label + '</td>' + r.keys.map(key => '<td>' + fmt(d[key], 2, 1000) + '</td>').join('') + '</tr>').join('');
+
+  setText('m-quality', 'Neutral ' + withUnit(fmt(d.i_n, 2), 'A') +
+          ' · I unbalance ' + withUnit(fmt(d.i_unbal_pct, 1), '%') +
+          ' · V unbalance L-L ' + withUnit(fmt(d.v_unbal_ll_pct, 1), '%') +
+          ' / L-N ' + withUnit(fmt(d.v_unbal_ln_pct, 1), '%'));
+
+  // One chart sample per meter poll (the board polls every 5 s, this page asks every 2 s)
+  if (d.poll !== lastPoll) {
+    lastPoll = d.poll;
+    if (d.meter_ok && d.p_total_w != null) {
+      pushHist(hist.pt, d.p_total_w / 1000);
+      pushHist(hist.p1, d.p1 / 1000);
+      pushHist(hist.p2, d.p2 / 1000);
+      pushHist(hist.p3, d.p3 / 1000);
+      pushHist(hist.i1, d.i1);
+      pushHist(hist.i2, d.i2);
+      pushHist(hist.i3, d.i3);
+      drawChart('chart-power', [hist.pt, hist.p1, hist.p2, hist.p3], ['#2d5d3f', '#4a7fb5', '#d4a137', '#c94c4c']);
+      drawChart('chart-current', [hist.i1, hist.i2, hist.i3], ['#4a7fb5', '#d4a137', '#c94c4c']);
+      setText('m-updated', new Date().toLocaleTimeString());
+    }
+  }
+}
+
+function pollMeter() {
+  fetch('/power').then(r => r.json()).then(renderMeter).catch(err => console.error('pollMeter error', err));
+}
+
+function loadMeter() {
+  fetch('/meter').then(r => r.json()).then(m => {
+    document.getElementById('m-addr').value   = m.addr;
+    document.getElementById('m-baud').value   = m.baud;
+    document.getElementById('m-parity').value = m.parity;
+    document.getElementById('m-sim').value    = m.sim ? '1' : '0';
   }).catch(() => {});
 }
 
-function setSensorType(type) {
-  fetch('/set_sensor_type', {
+function saveMeter() {
+  showMsg('Saving meter settings...', 'info');
+  fetch('/set_meter', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'type=' + type
+    body: 'addr=' + encodeURIComponent(document.getElementById('m-addr').value) +
+          '&baud=' + document.getElementById('m-baud').value +
+          '&parity=' + document.getElementById('m-parity').value +
+          '&sim=' + document.getElementById('m-sim').value
   })
   .then(r => r.json())
   .then(res => {
     if (res.status === 'ok') {
-      document.getElementById('sensor-type-selected').textContent =
-        '✓ Set to ' + (SENSOR_LABELS[type] || type);
-      document.getElementById('sensor-type-selected').style.color = 'var(--green)';
-      document.getElementById('sensor-type-badge').textContent = SENSOR_LABELS[type] || type;
-
-      applySensorTypeVisibility(type);
-
-      showMsg('✓ Sensor type saved', 'success');
-    }
-  })
-  .catch(() => showMsg('Failed to set sensor type', 'error'));
-}
-
-// Soil model popup — fires only for the "Soil" button, before sensor_type=2
-// is saved. Environment/Mineral go straight through setSensorType() as before.
-function openSoilModelPopup() {
-  document.getElementById('soil-model-popup').classList.remove('hidden');
-}
-function closeSoilModelPopup() {
-  document.getElementById('soil-model-popup').classList.add('hidden');
-}
-function confirmSoilModel(model) {
-  fetch('/set_soil_model', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'model=' + model
-  })
-  .then(r => r.json())
-  .then(res => {
-    if (res.status === 'ok') {
-      applySoilModelVisibility(model);
-      closeSoilModelPopup();
-      setSensorType(2);   // saves sensor_type=2 and shows card-soil, as before
+      Object.keys(hist).forEach(k => { hist[k].length = 0; });   // new data source: start the charts over
+      lastPoll = -1;
+      showMsg('✓ Meter settings saved', 'success');
+      loadMeter();
     } else {
-      showMsg('Failed to set soil model', 'error');
+      showMsg(res.message || 'Invalid settings', 'error');
     }
   })
-  .catch(() => showMsg('Failed to set soil model', 'error'));
+  .catch(() => showMsg('Failed to save', 'error'));
 }
 
 // Initialize on page load
 window.addEventListener('load', function() {
   updateStatus();
-  loadSensorType();
-  loadSoilModel();
-  loadThresholds();
-  loadRs485Thresh();
-  pollSensors();
+  loadMeter();
+  pollMeter();
   pollLogs();
   
   // Set up polling intervals
-  setInterval(pollSensors, 3000);
+  setInterval(pollMeter, 2000);
   setInterval(updateStatus, 5000);
   setInterval(pollLogs, 1000);
 });
@@ -1116,19 +740,11 @@ const char DISCOVER_PAGE[] PROGMEM = R"rawliteral(
     
     .card-ip { font-family: var(--mono); font-size: 0.85rem; color: var(--accent); margin-bottom: 16px; font-weight: 600; }
     
-    .sensors { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
-    .sensor-item { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
-    .sensor-item.full-width { grid-column: 1 / -1; }
-    .sensor-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; font-weight: 600; }
-    .sensor-val { font-family: var(--mono); font-size: 0.95rem; font-weight: 600; color: var(--accent); }
-    .sensor-val.light-on { color: var(--yellow); }
-    .sensor-val.light-off { color: var(--muted); }
-    .sensor-val.aqi-1 { color: var(--green); }
-    .sensor-val.aqi-2 { color: #5da86b; }
-    .sensor-val.aqi-3 { color: var(--yellow); }
-    .sensor-val.aqi-4 { color: #d4824d; }
-    .sensor-val.aqi-5 { color: var(--red); }
-    
+    .meter { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+    .meter-item { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+    .meter-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; font-weight: 600; }
+    .meter-val { font-family: var(--mono); font-size: 0.95rem; font-weight: 600; color: var(--accent); }
+
     .card-footer { font-family: var(--mono); font-size: 0.7rem; color: var(--muted); display: flex; justify-content: space-between; border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px; }
     .card-footer span:last-child { color: var(--accent); font-weight: 600; }
     
@@ -1157,7 +773,7 @@ const char DISCOVER_PAGE[] PROGMEM = R"rawliteral(
   <header>
     <div class="logo-block">
       <div class="label">// device discovery</div>
-      <h1>BOSS FARM <span>MONITOR</span></h1>
+      <h1>BOSS FARM <span>POWER METER</span></h1>
     </div>
     <div class="status-pill" id="status-pill">
       <span class="dot"></span>
@@ -1199,7 +815,7 @@ const char DISCOVER_PAGE[] PROGMEM = R"rawliteral(
   <div class="grid" id="grid">
     <div class="empty">
       <div class="icon">📡</div>
-      <p>Enter your subnet and hit <strong>Scan Network</strong>.<br>All ESP32 Smart Monitor units on the same WiFi will appear here.</p>
+      <p>Enter your subnet and hit <strong>Scan Network</strong>.<br>All ESP32 units (PM2200 power meters included) on the same WiFi will appear here.</p>
     </div>
   </div>
 </div>
@@ -1221,38 +837,11 @@ function setStatus(text, state) {
   txt.textContent = text;
 }
 
-function aqiClass(aqi) {
-  if (!aqi || aqi < 1 || aqi > 5) return '';
-  return 'aqi-' + aqi;
-}
-
-function formatSensorVal(d) {
-  const items = [];
-  if (d.temp !== undefined && d.temp !== null)
-    items.push({ label: '🌡 Temp', val: d.temp.toFixed(1) + ' °C', cls: '' });
-  if (d.hum !== undefined && d.hum !== null)
-    items.push({ label: '💧 Humidity', val: d.hum.toFixed(1) + ' %', cls: '' });
-  if (d.aqi !== undefined && d.aqi >= 1 && d.aqi <= 5)
-    items.push({ label: '🌬 AQI', val: d.aqi + ' — ' + (d.aqi_label || ''), cls: aqiClass(d.aqi) });
-  if (d.tvoc !== undefined && d.tvoc >= 0)
-    items.push({ label: '💨 TVOC', val: d.tvoc + ' ppb', cls: '' });
-  if (d.eco2 !== undefined && d.eco2 >= 400)
-    items.push({ label: '💨 eCO2', val: d.eco2 + ' ppm', cls: '' });
-  if (d.light_on !== undefined)
-    items.push({ label: '💡 Light', val: d.light_on ? 'ON' : 'OFF', cls: d.light_on ? 'light-on' : 'light-off' });
-  if (d.aqi_status && d.aqi_status !== 'Initialising' && d.aqi_status !== 'Error')
-    items.push({ label: '📊 Air Status', val: d.aqi_status, cls: '' });
-  return items;
-}
-
-function renderCard(ip, info, sensors) {
-  const sensorItems = formatSensorVal(sensors);
-  const sensorsHtml = sensorItems.length
-    ? sensorItems.map((s, i) => {
-        const fw = s.label.includes('Air Status') || (sensorItems.length % 2 !== 0 && i === sensorItems.length - 1);
-        return '<div class="sensor-item' + (fw ? ' full-width' : '') + '"><div class="sensor-label">' + s.label + '</div><div class="sensor-val ' + s.cls + '">' + s.val + '</div></div>';
-      }).join('')
-    : '<div class="sensor-item full-width"><div class="sensor-label">Sensors</div><div class="sensor-val" style="color:var(--muted)">No data</div></div>';
+function renderCard(ip, info, power) {
+  const p = power || {};
+  const kw  = p.p_total_w == null ? '–' : (p.p_total_w / 1000).toFixed(2) + ' kW';
+  const kwh = p.energy_wh == null ? '–' : (p.energy_wh / 1000).toFixed(1) + ' kWh';
+  const mode = power ? (p.simulated ? 'simulated' : (p.meter_ok ? 'meter OK' : 'no meter response')) : 'no meter data';
 
   const card = document.createElement('a');
   card.className = 'card';
@@ -1267,9 +856,12 @@ function renderCard(ip, info, sensors) {
       <span class="online-badge">● ONLINE</span>
     </div>
     <div class="card-ip">${ip}</div>
-    <div class="sensors">${sensorsHtml}</div>
+    <div class="meter">
+      <div class="meter-item"><div class="meter-label">⚡ Active power</div><div class="meter-val">${kw}</div></div>
+      <div class="meter-item"><div class="meter-label">🔋 Energy</div><div class="meter-val">${kwh}</div></div>
+    </div>
     <div class="card-footer">
-      <span>fw ${sensors.firmware || '–'}</span>
+      <span>fw ${info.firmware || '–'} · ${mode}</span>
       <span>Open UI →</span>
     </div>
   `;
@@ -1301,16 +893,16 @@ async function probeIp(ip, timeoutMs) {
   }
   
   if (!info.device_name || !info.device_name.startsWith('ESP32')) return null;
-  
-  let sensors = {};
-  const sensRes = await fetchWithTimeout('http://' + ip + '/sensors', timeoutMs);
-  if (sensRes && sensRes.ok) {
+
+  let power = null;
+  const powRes = await fetchWithTimeout('http://' + ip + '/power', timeoutMs);
+  if (powRes && powRes.ok) {
     try {
-      sensors = await sensRes.json();
+      power = await powRes.json();
     } catch {}
   }
-  
-  return { ip, info, sensors };
+
+  return { ip, info, power };
 }
 
 async function startScan() {
@@ -1364,7 +956,7 @@ async function startScan() {
       if (result) {
         foundCount++;
         document.getElementById('stat-found').textContent = foundCount;
-        document.getElementById('grid').appendChild(renderCard(result.ip, result.info, result.sensors));
+        document.getElementById('grid').appendChild(renderCard(result.ip, result.info, result.power));
       }
     }
     
@@ -1382,7 +974,7 @@ async function startScan() {
     document.getElementById('grid').innerHTML = `
       <div class="empty">
         <div class="icon">🔍</div>
-        <p>No ESP32 Smart Monitor units found on <strong>${subnet}.${from}–${to}</strong>.<br>Make sure all units are on the same WiFi and try adjusting the subnet or timeout.</p>
+        <p>No ESP32 units found on <strong>${subnet}.${from}–${to}</strong>.<br>Make sure all units are on the same WiFi and try adjusting the subnet or timeout.</p>
       </div>
     `;
     setStatus('No devices found', '');
@@ -1403,64 +995,6 @@ function stopScan() {
 </body>
 </html>
 )rawliteral";
-
-// ── Global threshold variables ────────────────────────────────────────────────
-float threshTemp    = 30.0f;
-float threshTempLow =  5.0f;
-float tempOffset    = TEMP_OFFSET_DEFAULT;
-float humOffset     = 0.0f;
-float co2Offset     = 0.0f;
-int   ldrThresh     = LDR_THRESHOLD;
-float threshHum     = 80.0f;
-float threshHumLow  = 20.0f;
-float threshCO2     = 1000.0f;
-
-extern float sensorTemp;
-extern float sensorHum;
-extern bool  alertTemp;
-extern bool  alertHum;
-
-static const char* THRESH_NVS_NS = "thresholds";
-
-// ── RS485 sensor thresholds (referenced by rs485_sensor.cpp) ─────────────────
-float threshWaterPhLow    = 5.5f;
-float threshWaterPhHigh   = 7.5f;
-float threshWaterEcHigh   = 3000.0f;
-float threshSoilMoistLow  = 20.0f;
-float threshSoilMoistHigh = 80.0f;
-float threshSoilEcHigh    = 2000.0f;
-float threshSoilPhLow     = 5.5f;
-float threshSoilPhHigh    = 7.5f;
-
-static const char* RS485_THRESH_NVS_NS = "rs485thresh";
-
-static void loadRs485ThreshFromNVS() {
-    Preferences prefs;
-    prefs.begin(RS485_THRESH_NVS_NS, true);
-    threshWaterPhLow    = prefs.getFloat("wph_low",     5.5f);
-    threshWaterPhHigh   = prefs.getFloat("wph_high",    7.5f);
-    threshWaterEcHigh   = prefs.getFloat("wec_high", 3000.0f);
-    threshSoilMoistLow  = prefs.getFloat("smoist_low",  20.0f);
-    threshSoilMoistHigh = prefs.getFloat("smoist_high", 80.0f);
-    threshSoilEcHigh    = prefs.getFloat("sec_high", 2000.0f);
-    threshSoilPhLow     = prefs.getFloat("sph_low",     5.5f);
-    threshSoilPhHigh    = prefs.getFloat("sph_high",    7.5f);
-    prefs.end();
-}
-
-static void saveRs485ThreshToNVS() {
-    Preferences prefs;
-    prefs.begin(RS485_THRESH_NVS_NS, false);
-    prefs.putFloat("wph_low",     threshWaterPhLow);
-    prefs.putFloat("wph_high",    threshWaterPhHigh);
-    prefs.putFloat("wec_high",    threshWaterEcHigh);
-    prefs.putFloat("smoist_low",  threshSoilMoistLow);
-    prefs.putFloat("smoist_high", threshSoilMoistHigh);
-    prefs.putFloat("sec_high",    threshSoilEcHigh);
-    prefs.putFloat("sph_low",     threshSoilPhLow);
-    prefs.putFloat("sph_high",    threshSoilPhHigh);
-    prefs.end();
-}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1496,50 +1030,6 @@ static String getDeviceMacString() {
     snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     return String(buf);
-}
-
-static void loadThresholdsFromNVS() {
-    Preferences prefs;
-    prefs.begin(THRESH_NVS_NS, true);
-    threshTemp    = prefs.getFloat("temp",      30.0f);
-    threshTempLow = prefs.getFloat("temp_low",   5.0f);
-    tempOffset    = prefs.getFloat("temp_offset", TEMP_OFFSET_DEFAULT);
-    humOffset     = prefs.getFloat("hum_offset",  0.0f);
-    co2Offset     = prefs.getFloat("co2_offset",  0.0f);
-    ldrThresh     = prefs.getInt("ldr_thresh",    LDR_THRESHOLD);
-    threshHum     = prefs.getFloat("hum",       80.0f);
-    threshHumLow  = prefs.getFloat("hum_low",   20.0f);
-    threshCO2     = prefs.getFloat("eco2",    1000.0f);
-    prefs.end();
-    Serial.printf("[Thresh] Loaded — TempH:%.1f TempL:%.1f HumH:%.1f HumL:%.1f CO2:%.0f\n",
-                  threshTemp, threshTempLow, threshHum, threshHumLow, threshCO2);
-}
-
-static void saveThresholdsToNVS(float temp, float tempLow, float hum, float humLow, float co2, float offset) {
-    Preferences prefs;
-    prefs.begin(THRESH_NVS_NS, false);
-    prefs.putFloat("temp",        temp);
-    prefs.putFloat("temp_low",    tempLow);
-    prefs.putFloat("hum",         hum);
-    prefs.putFloat("hum_low",     humLow);
-    prefs.putFloat("co2",         co2);
-    prefs.putFloat("temp_offset", offset);
-    prefs.putFloat("hum_offset",  humOffset);
-    prefs.putFloat("co2_offset",  co2Offset);
-    prefs.putInt("ldr_thresh",    ldrThresh);
-    prefs.end();
-}
-
-static String getTelemetryDeviceId() {
-    uint8_t type = localMqttGetSensorType();
-    const char* prefix = "ENV_";
-    if (type == 2) prefix = "SOIL_";
-    else if (type == 3) prefix = "MIN_";
-
-    String mac = WiFi.macAddress();
-    mac.replace(":", "");
-    String suffix = mac.length() >= 4 ? mac.substring(mac.length() - 4) : mac;
-    return String(prefix) + suffix;
 }
 
 // ── HTTP Handlers ─────────────────────────────────────────────────────────────
@@ -1638,6 +1128,54 @@ static void handleDeviceInfo() {
     server.send(200, "application/json", buf);
 }
 
+// Live meter values for the setup page and the discovery cards. Same keys/units as the MQTT
+// `reading` object (docs/payload.md) plus status, so the page shows exactly what is published.
+static void handlePower() {
+    addCorsHeaders();
+
+    char buf[1400];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"sensor_ok\":%s,\"meter_ok\":%s,\"simulated\":%s,\"status\":\"%s\",\"poll\":%lu",
+        pm2200SensorOK ? "true" : "false",
+        pm2200MeterOK  ? "true" : "false",
+        pm2200Simulated() ? "true" : "false",
+        pm2200StatusLabel(),
+        (unsigned long)rs485PollCount);
+
+    int m = pm2200ReadingJson(buf + n, sizeof(buf) - n - 2);   // leave room for "}" and the NUL
+    if (n < 0 || m < 0) {
+        server.send(500, "application/json", "{\"status\":\"error\"}");
+        return;
+    }
+    strcpy(buf + n + m, "}");
+    server.send(200, "application/json", buf);
+}
+
+static void handleGetMeter() {
+    addCorsHeaders();
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"addr\":%u,\"baud\":%lu,\"parity\":\"%c\",\"sim\":%s}",
+             pm2200Addr(), (unsigned long)pm2200Baud(), pm2200Parity(),
+             pm2200Simulated() ? "true" : "false");
+    server.send(200, "application/json", buf);
+}
+
+static void handleSetMeter() {
+    addCorsHeaders();
+    long   addr   = server.arg("addr").toInt();
+    long   baud   = server.arg("baud").toInt();
+    String parity = server.arg("parity");
+
+    bool baudOk   = (baud == 4800 || baud == 9600 || baud == 19200 || baud == 38400);
+    bool parityOk = (parity == "E" || parity == "O" || parity == "N");
+    if (addr < 1 || addr > 247 || !baudOk || !parityOk) {
+        server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid address, baud or parity\"}");
+        return;
+    }
+    pm2200ApplyConfig((uint8_t)addr, (uint32_t)baud, parity[0], server.arg("sim") == "1");
+    server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
 static void handleProvStatus() {
     bool provisioned = provisioningHasToken();
     char buf[64];
@@ -1652,7 +1190,6 @@ static void handleProvision() {
     }
     String token = provisioningRequest();
     if (!token.isEmpty()) {
-        mqttSetToken(token);
         server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Provisioning successful\"}");
     } else {
         server.send(200, "application/json", "{\"status\":\"error\",\"message\":\"Provisioning failed\"}");
@@ -1669,163 +1206,6 @@ static void handleSetToken() {
     prefs.end();
     Serial.printf("[Web] Token saved: %.10s...\n", token.c_str());
     server.send(200, "application/json", "{\"status\":\"ok\"}");
-}
-
-static void handleSensors() {
-    addCorsHeaders();
-
-    char buf[1024];
-    char tempBuf[32];
-    char humBuf[32];
-    char co2Buf[16];
-
-    // guard against NaN/Inf so JSON stays valid
-    if (isnan(sensorTemp) || isinf(sensorTemp)) strncpy(tempBuf, "null", sizeof(tempBuf));
-    else snprintf(tempBuf, sizeof(tempBuf), "%.1f", sensorTemp);
-
-    if (isnan(sensorHum) || isinf(sensorHum)) strncpy(humBuf, "null", sizeof(humBuf));
-    else snprintf(humBuf, sizeof(humBuf), "%.1f", sensorHum);
-
-    snprintf(co2Buf, sizeof(co2Buf), "%u", sensorCO2);
-
-    snprintf(buf, sizeof(buf),
-        "{"
-        "\"temp\":%s,"
-        "\"hum\":%s,"
-        "\"co2\":%s,"
-        "\"co2_label\":\"%s\","
-        "\"alert_temp\":%s,\"alert_temp_num\":%d,"
-        "\"alert_hum\":%s,\"alert_hum_num\":%d,"
-        "\"alert_co2\":%s,\"alert_co2_num\":%d,"
-        "\"scd40_ok\":%s,"
-        "\"light_on\":%s,\"light_on_num\":%d,"
-        "\"ldr_ok\":%s,"
-        "\"sensor_type\":%u,"
-        "\"rs485_status\":\"%s\","
-        "\"water_ok\":%s,\"water_ph\":%.2f,\"water_ec\":%.0f,\"water_temp\":%.1f,"
-        "\"alert_water_ph\":%s,\"alert_water_ec\":%s,"
-        "\"soil_ok\":%s,\"soil_moist\":%.1f,\"soil_temp\":%.1f,\"soil_ec\":%.0f,"
-        "\"soil_ph\":%.1f,\"soil_n\":%u,\"soil_p\":%u,\"soil_k\":%u,"
-        "\"alert_soil_moist\":%s,\"alert_soil_ec\":%s,\"alert_soil_ph\":%s"
-        "}",
-        tempBuf, humBuf, co2Buf, co2Label(sensorCO2),
-        alertTemp  ? "true" : "false", alertTemp  ? 1 : 0,
-        alertHum   ? "true" : "false", alertHum   ? 1 : 0,
-        alertCO2   ? "true" : "false", alertCO2   ? 1 : 0,
-        sensorOK   ? "true" : "false",
-        ldrLightOn ? "true" : "false", ldrLightOnNum(),
-        ldrOK      ? "true" : "false",
-        rs485ActiveType(),
-        rs485StatusLabel(),
-        waterOK ? "true" : "false", waterPh, waterEc, waterTemp,
-        alertWaterPh ? "true" : "false", alertWaterEc ? "true" : "false",
-        soilOK ? "true" : "false", soilMoist, soilTemp, soilEc,
-        soilPh, soilN, soilP, soilK,
-        alertSoilMoist ? "true" : "false",
-        alertSoilEc    ? "true" : "false",
-        alertSoilPh    ? "true" : "false"
-    );
-    server.send(200, "application/json", buf);
-}
-
-static void handleSetThresh() {
-    bool fromApi = server.hasArg("from_api") && server.arg("from_api") == "1";
-
-    if (server.hasArg("temp"))        threshTemp    = server.arg("temp").toFloat();
-    if (server.hasArg("temp_low"))    threshTempLow = server.arg("temp_low").toFloat();
-    if (server.hasArg("temp_offset")) tempOffset    = server.arg("temp_offset").toFloat();
-    if (server.hasArg("hum_offset"))  humOffset     = server.arg("hum_offset").toFloat();
-    if (server.hasArg("co2_offset"))  co2Offset     = server.arg("co2_offset").toFloat();
-    if (server.hasArg("ldr_thresh"))  ldrThresh     = (int)server.arg("ldr_thresh").toFloat();
-    if (server.hasArg("hum"))         threshHum     = server.arg("hum").toFloat();
-    if (server.hasArg("hum_low"))     threshHumLow  = server.arg("hum_low").toFloat();
-    if (server.hasArg("co2"))         threshCO2     = server.arg("co2").toFloat();
-
-    saveThresholdsToNVS(threshTemp, threshTempLow, threshHum, threshHumLow, threshCO2, tempOffset);
-
-    Serial.printf("[Thresh] Saved — TempH:%.1f TempL:%.1f HumH:%.1f HumL:%.1f CO2:%.0f\n",
-                  threshTemp, threshTempLow, threshHum, threshHumLow, threshCO2);
-
-    alertTemp = (sensorTemp > threshTemp) || (sensorTemp < threshTempLow);
-    alertHum  = (sensorHum  > threshHum)  || (sensorHum  < threshHumLow);
-    alertCO2  = (sensorCO2  > threshCO2);
-
-    if (localMqttIsConnected()) {
-        localMqttPublishConfig(threshTemp, threshTempLow, threshHum, threshHumLow, threshCO2);
-    }
-
-    if (!fromApi && WiFi.isConnected()) {
-        String deviceId = getTelemetryDeviceId();
-        String apiUrl   = "http://192.168.0.16:8000/api/thresholds/" + deviceId;
-
-        StaticJsonDocument<256> doc;
-        doc["device_id"] = deviceId;
-        JsonObject thresh = doc.createNestedObject("thresholds");
-        thresh["temp_high"] = threshTemp;
-        thresh["temp_low"]  = threshTempLow;
-        thresh["hum_high"]  = threshHum;
-        thresh["hum_low"]   = threshHumLow;
-        thresh["co2_high"]  = threshCO2;
-
-        String payload;
-        serializeJson(doc, payload);
-
-        HTTPClient http;
-        http.begin(apiUrl);
-        http.addHeader("Content-Type", "application/json");
-        int httpCode = http.POST(payload);
-        Serial.printf("[Thresh] API update HTTP %d\n", httpCode);
-        http.end();
-    }
-
-    if (mqttIsConnected()) mqttPublishAttributes();
-    server.send(200, "text/plain", "OK");
-}
-
-static void handleGetThresh() {
-    char buf[400];
-    snprintf(buf, sizeof(buf),
-             "{\"temp\":%.2f,\"temp_low\":%.2f,\"hum\":%.2f,\"hum_low\":%.2f,\"co2\":%.0f,"
-             "\"temp_offset\":%.2f,\"hum_offset\":%.2f,\"co2_offset\":%.0f,\"ldr_thresh\":%d}",
-             threshTemp, threshTempLow, threshHum, threshHumLow, threshCO2,
-             tempOffset, humOffset, co2Offset, ldrThresh);
-    server.send(200, "application/json", buf);
-}
-
-static void handleGetRs485Thresh() {
-    addCorsHeaders();
-    char buf[320];
-    snprintf(buf, sizeof(buf),
-        "{\"wph_low\":%.2f,\"wph_high\":%.2f,\"wec_high\":%.0f,"
-        "\"smoist_low\":%.1f,\"smoist_high\":%.1f,\"sec_high\":%.0f,"
-        "\"sph_low\":%.2f,\"sph_high\":%.2f}",
-        threshWaterPhLow, threshWaterPhHigh, threshWaterEcHigh,
-        threshSoilMoistLow, threshSoilMoistHigh, threshSoilEcHigh,
-        threshSoilPhLow, threshSoilPhHigh);
-    server.send(200, "application/json", buf);
-}
-
-static void handleSetRs485Thresh() {
-    if (server.hasArg("wph_low"))     threshWaterPhLow    = server.arg("wph_low").toFloat();
-    if (server.hasArg("wph_high"))    threshWaterPhHigh   = server.arg("wph_high").toFloat();
-    if (server.hasArg("wec_high"))    threshWaterEcHigh   = server.arg("wec_high").toFloat();
-    if (server.hasArg("smoist_low"))  threshSoilMoistLow  = server.arg("smoist_low").toFloat();
-    if (server.hasArg("smoist_high")) threshSoilMoistHigh = server.arg("smoist_high").toFloat();
-    if (server.hasArg("sec_high"))    threshSoilEcHigh    = server.arg("sec_high").toFloat();
-    if (server.hasArg("sph_low"))     threshSoilPhLow     = server.arg("sph_low").toFloat();
-    if (server.hasArg("sph_high"))    threshSoilPhHigh    = server.arg("sph_high").toFloat();
-
-    saveRs485ThreshToNVS();
-
-    // Recompute alert flags against current readings immediately
-    alertWaterPh   = waterOK && ((waterPh < threshWaterPhLow) || (waterPh > threshWaterPhHigh));
-    alertWaterEc   = waterOK && (waterEc > threshWaterEcHigh);
-    alertSoilMoist = soilOK  && ((soilMoist < threshSoilMoistLow) || (soilMoist > threshSoilMoistHigh));
-    alertSoilEc    = soilOK  && (soilEc > threshSoilEcHigh);
-    alertSoilPh    = soilOK  && ((soilPh < threshSoilPhLow) || (soilPh > threshSoilPhHigh));
-
-    Serial.println("[Thresh] RS485 thresholds saved");
-    server.send(200, "text/plain", "OK");
 }
 
 static void handleFactoryReset() {
@@ -1899,57 +1279,6 @@ static void handleBrokerStatus() {
     server.send(200, "application/json", buf);
 }
 
-// Sensor type for UI display purposes (1=environment, 2=soil, 3=mineral)
-static void handleGetSensorType() {
-    uint8_t t = rs485ActiveType();
-    char buf[80];
-    const char* labels[] = { "", "environment", "soil", "mineral" };
-    snprintf(buf, sizeof(buf),
-             "{\"sensor_type\":%d,\"label\":\"%s\"}",
-             t, (t >= 1 && t <= 3) ? labels[t] : "environment");
-    server.send(200, "application/json", buf);
-}
-
-static void handleSetSensorType() {
-    if (!server.hasArg("type")) {
-        server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing type\"}");
-        return;
-    }
-    uint8_t t = (uint8_t)server.arg("type").toInt();
-    if (t < 1 || t > 3) {
-        server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"type must be 1, 2 or 3\"}");
-        return;
-    }
-    localMqttSetSensorType(t);
-    rs485ApplySensorType(t);   // live-switch the RS485 driver & baud rate
-    server.send(200, "application/json", "{\"status\":\"ok\"}");
-}
-
-// Soil sensor model for UI display purposes (0=Halisense, 1=XS-MEC20)
-static void handleGetSoilModel() {
-    uint8_t m = rs485SoilModel();
-    char buf[80];
-    const char* labels[] = { "halisense", "xs-mec20" };
-    snprintf(buf, sizeof(buf),
-             "{\"soil_model\":%d,\"label\":\"%s\"}",
-             m, (m <= 1) ? labels[m] : labels[0]);
-    server.send(200, "application/json", buf);
-}
-
-static void handleSetSoilModel() {
-    if (!server.hasArg("model")) {
-        server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing model\"}");
-        return;
-    }
-    uint8_t m = (uint8_t)server.arg("model").toInt();
-    if (m > 1) {
-        server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"model must be 0 or 1\"}");
-        return;
-    }
-    rs485SetSoilModel(m);   // persists to NVS; live-switches UART baud if soil is active
-    server.send(200, "application/json", "{\"status\":\"ok\"}");
-}
-
 // ── Server Init — ALL routes registered before server.begin() ─────────────────
 void webServerInit() {
     server.on("/",                          handleRoot);
@@ -1964,7 +1293,9 @@ void webServerInit() {
     server.onNotFound(handleCaptivePortal);
 
     // API
-    server.on("/sensors",       handleSensors);
+    server.on("/power",         HTTP_GET,  handlePower);
+    server.on("/meter",         HTTP_GET,  handleGetMeter);
+    server.on("/set_meter",     HTTP_POST, handleSetMeter);
     server.on("/wifi",          HTTP_GET,  handleWifiGet);
     server.on("/scan",          HTTP_GET,  handleScan);
     server.on("/set_wifi",      HTTP_POST, handleSetWifi);
@@ -1972,22 +1303,12 @@ void webServerInit() {
     server.on("/provision",     HTTP_POST, handleProvision);
     server.on("/device_info",   HTTP_GET,  handleDeviceInfo);
     server.on("/set_token",     HTTP_POST, handleSetToken);
-    server.on("/set_thresh",               handleSetThresh);
-    server.on("/get_thresh",    HTTP_GET,  handleGetThresh);
     server.on("/factory_reset", HTTP_POST, handleFactoryReset);
     server.on("/register",      HTTP_POST, handleRegister);
     server.on("/set_broker",    HTTP_POST, handleSetBroker);
     server.on("/broker_status", HTTP_GET,  handleBrokerStatus);
-    server.on("/get_sensor_type", HTTP_GET,  handleGetSensorType);
-    server.on("/set_sensor_type", HTTP_POST, handleSetSensorType);
-    server.on("/get_soil_model",  HTTP_GET,  handleGetSoilModel);
-    server.on("/set_soil_model",  HTTP_POST, handleSetSoilModel);
-    server.on("/get_rs485_thresh", HTTP_GET,  handleGetRs485Thresh);
-    server.on("/set_rs485_thresh",            handleSetRs485Thresh);
     server.on("/logs",          HTTP_GET,  handleLogs);
 
-    loadThresholdsFromNVS();
-    loadRs485ThreshFromNVS();
     server.begin();
     Serial.println("[Web] Server started");
 }

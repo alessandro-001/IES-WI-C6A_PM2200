@@ -4,17 +4,16 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include "config.h"
-#include "sensors.h"
 #include "wifi_config.h"
 #include "web_server.h"
 #include "provisioning.h"
-#include "mqtt.h"
 #include "local_mqtt.h"
 #include "factory_reset.h"
 #include "rs485_sensor.h"
+#include "pm2200.h"
 #include <esp_wifi.h>
 
-//* ESP32C6 Smart Monitor — MAIN
+//* ESP32C6 Power Meter (PM2200) — MAIN
 
 // ── NeoPixel ──────────────────────────────────────────────────────────────────
 Adafruit_NeoPixel ring(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
@@ -32,21 +31,6 @@ bool deviceIsCommissioned() {
     bool v = p.getBool(COMMISSIONED_KEY, false);
     p.end();
     return v;
-}
-
-// Sensor type persisted by local_mqtt (same "device" NVS namespace / "sensor_type" key).
-// Read here early so setup()/loop() can skip the environment sensors (SCD40, LDR) on
-// soil/mineral boards, which physically only have the RS485 sensor attached.
-// ponytail: 1=env, 2=soil, 3=mineral — must stay in sync with local_mqtt loadSensorType().
-static uint8_t bootSensorType = SENSOR_TYPE_DEFAULT;
-static bool isEnvironmentBoard() { return bootSensorType == 1; }
-
-static void loadBootSensorType() {
-    Preferences p;
-    p.begin(DEVICE_NVS_NS, true);
-    bootSensorType = p.getUChar("sensor_type", SENSOR_TYPE_DEFAULT);
-    p.end();
-    if (bootSensorType < 1 || bootSensorType > 3) bootSensorType = SENSOR_TYPE_DEFAULT;
 }
 
 static void setCommissioned() {
@@ -124,7 +108,7 @@ bool registerDevice() {
 void setup() {
     Serial.begin(115200);
     delay(1500);
-    Serial.println("\n====== BOSS FARM Smart Monitor ======");
+    Serial.println("\n====== BOSS FARM Power Meter (PM2200) ======");
 
     // ── NeoPixel + boot-stage indicator ──────────────────────────────────────
     // The LED doubles as a boot-progress beacon for blind/remote debugging:
@@ -139,7 +123,7 @@ void setup() {
 
     // ── Radio init FIRST, always ─────────────────────────────────────────────
     // Bring the AP up before any sensor/I2C init so a mis-wired bus can never
-    // prevent the hotspot from appearing (see scd40Init / I2C scan).
+    // prevent the hotspot from appearing.
     WiFi.persistent(false);
     WiFi.disconnect(false);
     delay(100);
@@ -152,19 +136,9 @@ void setup() {
     ring.show();
 
     // ── Sensors (after AP, so a stall is non-fatal to provisioning) ──────────
-    // Soil/mineral boards physically have only the RS485 sensor — no SCD40, no LDR.
-    // Skip the environment-sensor init entirely on those boards so a missing I2C /
-    // ADC device can never fault the firmware.
-    loadBootSensorType();
     factoryResetInit();
-    if (isEnvironmentBoard()) {
-        scd40Init();
-        ldrInit();
-    } else {
-        Serial.printf("[Boot] Sensor type %u — skipping SCD40 + LDR (RS485-only board)\n",
-                      bootSensorType);
-    }
-    rs485SensorInit();   // loads sensor type from NVS, starts UART only for type 2/3
+    rs485SensorInit();
+    pm2200Init();
 
     wifiConfigBegin(HOME_SSID, HOME_PASSWORD);
 
@@ -217,35 +191,7 @@ void loop() {
     // Short delay to prevent watchdog and allow background tasks to run.
     delay(1);
 
-    // Sensor reads every 2s, staggered to avoid doing them both at the same time.
-    // SCD40 + LDR only exist on environment boards; skip them on soil/mineral (RS485-only).
-    if (isEnvironmentBoard()) {
-        scd40Read();
-    }
-    rs485SensorRead();   // self-throttled to 5s; no-op for environment type
-
-    static uint32_t lastLdrCheck = 0;
-    if (isEnvironmentBoard() && now - lastLdrCheck >= SENSOR_INTERVAL) {
-        lastLdrCheck = now;
-
-        webServerHandle();
-        localMqttHandle();
-
-        ring.clear();
-        ring.show();
-        delay(20);
-
-        webServerHandle();
-        localMqttHandle();
-
-        ldrRead();
-    }
-
-    static bool warnedSCD40 = false;
-    if (isEnvironmentBoard() && !sensorOK && !warnedSCD40) {
-        Serial.println("WARNING: SCD40 not found - all sensors unavailable");
-        warnedSCD40 = true;
-    }
+    pm2200Read();   // self-throttled to 5s
 
     // NeoPixel update every LED_INTERVAL ms.
     // States (priority order):

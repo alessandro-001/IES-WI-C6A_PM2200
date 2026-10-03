@@ -1,53 +1,22 @@
-#pragma once 
+#pragma once
 #include <Arduino.h>
 
 
-//! ── RS485 Modbus RTU Sensor Driver ───────────────────────────────────────────
+//! ── RS485 Modbus RTU Transport ───────────────────────────────────────────────
 //
 // Hardware (IES-WI-C6A, see schematic):
 //   MAX3485 DI  <- GPIO16 (TXD0 pad, driven as UART1 via GPIO matrix)
 //   MAX3485 RO  -> GPIO17 (RXD0 pad, driven as UART1 via GPIO matrix)
 //   MAX3485 DE+RE (RS485_FC) <- GPIO14   HIGH = transmit, LOW = receive
 //
-// Driver selection is bound to the existing device sensor type:
-//   1 = Environment (SCD40/LDR only — RS485 idle, UART not initialised)
-//   2 = Soil        -> two selectable models (soil_model NVS key, default 0):
-//                        0 = Halisense Soil 7-in-1 (4800,N,8,1, regs 0x0000..0x0006)
-//                        1 = XS-MEC20 Soil VWC/EC  (9600,N,8,1, regs 0x0000..0x0002)
-//   3 = Mineral     -> CWT-OYS-PHEC Water pH/EC (9600,N,8,1, addr 1, regs 0x0000..0x0002)
-//
-// Only ONE sensor is ever connected at a time (single-drop bus).
-
-//! ── Water pH/EC shared state (sensor type 3) ────────────────────────────────
-extern float waterPh;            // pH            (raw / 100)
-extern float waterEc;            // uS/cm         (raw)
-extern float waterTemp;          // degC          (raw / 10)
-extern bool  waterOK;            // last poll cycle succeeded
-extern bool  alertWaterPh;       // outside [threshWaterPhLow, threshWaterPhHigh]
-extern bool  alertWaterEc;       // above threshWaterEcHigh
-
-//! ── Soil shared state (sensor type 2, Halisense or XS-MEC20 per soil_model) ─
-extern float    soilMoist;       // Halisense: %RH (raw/10) — XS-MEC20: VWC % (raw/100)
-extern float    soilTemp;        // degC          (signed; /10 Halisense, /100 XS-MEC20)
-extern float    soilEc;          // uS/cm         (raw)
-extern float    soilPh;          // pH (raw/10) on Halisense — always 0.0 on XS-MEC20 (no pH)
-extern uint16_t soilN;           // mg/kg (raw) on Halisense — always 0 on XS-MEC20 (no NPK)
-extern uint16_t soilP;           // mg/kg (raw) on Halisense — always 0 on XS-MEC20 (no NPK)
-extern uint16_t soilK;           // mg/kg (raw) on Halisense — always 0 on XS-MEC20 (no NPK)
-extern bool     soilOK;          // last poll cycle succeeded
-extern bool     alertSoilMoist;  // outside [threshSoilMoistLow, threshSoilMoistHigh]
-extern bool     alertSoilEc;     // above threshSoilEcHigh
-extern bool     alertSoilPh;     // outside [threshSoilPhLow, threshSoilPhHigh] on Halisense — always false on XS-MEC20
+// Only ONE meter is ever connected (single-drop bus): the Schneider PM2200,
+// read by pm2200.cpp on top of modbusReadHolding().
 
 //! ── Diagnostics ──────────────────────────────────────────────────────────────
 extern uint32_t rs485PollCount;  // total poll attempts since boot
 extern uint32_t rs485FailCount;  // total failed polls since boot (timeout/CRC/invalid)
 
 //! ── API ──────────────────────────────────────────────────────────────────────
-void    rs485SensorInit();              // call once in setup() — reads type + soil model from NVS
-void    rs485SensorRead();              // call in loop() — internally throttled (5s)
-void    rs485ApplySensorType(uint8_t t);// call after web UI changes type (1/2/3)
-uint8_t rs485ActiveType();              // currently active type
-void    rs485SetSoilModel(uint8_t m);   // call after web UI changes soil model (0=Halisense,1=XS-MEC20)
-uint8_t rs485SoilModel();               // currently active soil model
-const char* rs485StatusLabel();         // "idle" / "ok" / "no response" — for UI/logs
+void rs485SensorInit();                 // call once in setup() — DE/RE pin to receive
+void rs485BeginUart(uint32_t baud, uint32_t serialCfg);   // (re)open UART1, serialCfg = SERIAL_8E1 / 8O1 / 8N2 ...
+bool modbusReadHolding(uint8_t addr, uint16_t startReg, uint16_t count, uint16_t* out);   // FC 0x03, count <= 32

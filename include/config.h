@@ -3,19 +3,12 @@
 #include "secrets.h"
 
 //! ── Access Point ─────────────────────────────────────────────────────────────
-#define AP_SSID             "ESP32C6_Hotspot"
+#define AP_SSID             "PM2200_Hotspot"
 
 //! ── Hardware Pins ESP32-C6 ───────────────────────────────────────────────────
 #define NEOPIXEL_PIN        20 // 3 (old)
 #define NUM_LEDS            12
 #define BRIGHTNESS          10
-
-#define I2C_SDA             6 // 7(C3) 6(C6)
-#define I2C_SCL             7 // 6(C3) 7(C6)
-
-#define LDR_PIN             0
-#define LDR_THRESHOLD       50
-#define LDR_ENABLED         1
 
 #define FACTORY_RESET_PIN   5 // 4 (old)
 
@@ -23,20 +16,18 @@
 #define SENSOR_INTERVAL     5000
 #define LED_INTERVAL        20
 
-//! ── Temperature Range ────────────────────────────────────────────────────────
-#define TEMP_MIN            15.0f
-#define TEMP_MAX            35.0f
-
 //! (Provisioning host and platform-specific defines removed)
 
 //! ── Device Identity ──────────────────────────────────────────────────────────
 #define DEVICE_GROUP        "PROTO_BF_DEVICES"
-#define FIRMWARE_VERSION    "2.1.0"
-#define TEMP_OFFSET_DEFAULT  0.0f   // °C — negative to reduce reading
+#define FIRMWARE_VERSION    "1.0.0"
 
-//! ── Sensor Type ──────────────────────────────────────────────────────────────
-// 1 = environment, 2 = soil, 3 = mineral
-#define SENSOR_TYPE_DEFAULT 1
+//! ── Device Type ──────────────────────────────────────────────────────────────
+// Fixed: this firmware is the PM2200 power meter only (no runtime sensor switching).
+#define SENSOR_TYPE_ID      4
+#define SENSOR_TYPE_LABEL   "power"
+#define DEVICE_ID_PREFIX    "PM_"      // device_id = prefix + last 4 MAC hex chars
+#define MQTT_MEASUREMENT    "power"    // sensors/<device_id>/power
 
 //! ── Local MQTT (Raspberry Pi / Docker) ──────────────────────────────────────
 #define LOCAL_MQTT_SERVER   "weedsync.local"
@@ -54,8 +45,9 @@
 #define RS485_POLL_INTERVAL   SENSOR_INTERVAL   // poll every 5s
 #define RS485_MAX_FAILS       3     // consecutive failures before flagged unavailable
 
-#define WATER_SENSOR_ADDR     1     // CWT-OYS-PHEC default slave ID
-#define WATER_SENSOR_BAUD     9600  // CWT default: 9600,N,8,1
-#define SOIL_SENSOR_ADDR            1     // default slave ID for both soil probes
-#define SOIL_SENSOR_BAUD_HALISENSE  4800  // Halisense default: 4800,N,8,1
-#define SOIL_SENSOR_BAUD_XSMEC20    9600  // XS-MEC20 default: 9600,N,8,1
+//! ── PM2200 defaults (overridden by NVS "pm2200", set from the setup page) ───
+// The manual does not state the meter's defaults: match these to its front panel (Comm setup).
+#define PM2200_ADDR_DEFAULT   1
+#define PM2200_BAUD_DEFAULT   9600  // 4800 / 9600 / 19200 / 38400
+#define PM2200_PARITY_DEFAULT 'E'   // 'E' / 'O' = 1 stop bit, 'N' = 2 stop bits
+#define PM2200_SIM_DEFAULT    true  // true = generated values, no meter attached (set false for the real meter)

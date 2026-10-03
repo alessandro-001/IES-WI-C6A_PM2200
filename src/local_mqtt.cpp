@@ -1,29 +1,29 @@
 #include "local_mqtt.h"
 
 #include "config.h"
-#include "sensors.h"
 #include "web_server.h"
 #include "rs485_sensor.h"
+#include "pm2200.h"
 
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include <math.h>
 #include <time.h>
 #include <ESPmDNS.h>
 
 // Firmware MQTT target:
 // ESP32-C6 -> Raspberry Pi MQTT broker -> mqtt_to_influx.py -> InfluxDB
 //
-// Docker bridge expects topics:
-// sensors/+/telemetry
-// sensors/+/attributes
-// sensors/+/soil
-// sensors/+/mineral
+// Topics published (payload contract: docs/payload.md):
+// sensors/PM_<last4mac>/power        every 5 s
+// sensors/PM_<last4mac>/attributes   retained, every 60 s and on reconnect
+//
+// The Docker bridge must subscribe to sensors/+/power (new topic, same envelope).
 
 static WiFiClient localWifiClient;
 static PubSubClient localMqtt(localWifiClient);
 
-static uint8_t gSensorType = SENSOR_TYPE_DEFAULT;
 static String gBrokerHost = LOCAL_MQTT_SERVER;
 static uint16_t gBrokerPort = LOCAL_MQTT_PORT;
 
@@ -45,39 +45,12 @@ static String getDeviceSuffix() {
   return mac.length() >= 4 ? mac.substring(mac.length() - 4) : mac;
 }
 
-static const char* sensorTypePrefix(uint8_t type) {
-  switch (type) {
-    case 1: return "ENV_";
-    case 2: return "SOIL_";
-    case 3: return "MIN_";
-    default: return "ENV_";
-  }
-}
-
-static const char* sensorTypeLabel(uint8_t type) {
-  switch (type) {
-    case 1: return "environment";
-    case 2: return "soil";
-    case 3: return "mineral";
-    default: return "environment";
-  }
-}
-
-static const char* measurementFromSensorType(uint8_t type) {
-  switch (type) {
-    case 1: return "telemetry";
-    case 2: return "soil";
-    case 3: return "mineral";
-    default: return "telemetry";
-  }
-}
-
 static String getDeviceId() {
-  return String(sensorTypePrefix(gSensorType)) + getDeviceSuffix();
+  return String(DEVICE_ID_PREFIX) + getDeviceSuffix();
 }
 
 static String buildDataTopic() {
-  return "sensors/" + getDeviceId() + "/" + String(measurementFromSensorType(gSensorType));
+  return "sensors/" + getDeviceId() + "/" + String(MQTT_MEASUREMENT);
 }
 
 static String buildAttributesTopic() {
@@ -86,18 +59,6 @@ static String buildAttributesTopic() {
 
 static const char* boolText(bool v) {
   return v ? "true" : "false";
-}
-
-static int boolNum(bool v) {
-  return v ? 1 : 0;
-}
-
-static const char* co2LabelLocal(int co2) {
-  if (co2 <= 0) return "Unavailable";
-  if (co2 < 800) return "Good";
-  if (co2 < 1200) return "Moderate";
-  if (co2 < 2000) return "Poor";
-  return "Very Poor";
 }
 
 static String isoTimestampUtc() {
@@ -117,42 +78,14 @@ static String isoTimestampUtc() {
   return String(buf);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Sensor Type NVS
-// ─────────────────────────────────────────────────────────────────────────────
-
-void localMqttSetSensorType(uint8_t type) {
-  if (type < 1 || type > 3) type = SENSOR_TYPE_DEFAULT;
-
-  gSensorType = type;
-
-  Preferences p;
-  p.begin("device", false);
-  p.putUChar("sensor_type", type);
-  p.end();
-
-  Serial.printf("[LocalMQTT] Sensor type set -> %u (%s)\n",
-                gSensorType,
-                sensorTypeLabel(gSensorType));
-}
-
-uint8_t localMqttGetSensorType() {
-  return gSensorType;
-}
-
-static void loadSensorType() {
-  Preferences p;
-  p.begin("device", true);
-  gSensorType = p.getUChar("sensor_type", SENSOR_TYPE_DEFAULT);
-  p.end();
-
-  if (gSensorType < 1 || gSensorType > 3) {
-    gSensorType = SENSOR_TYPE_DEFAULT;
+// Optional `"timestamp":"...",` fragment for the envelope (empty while NTP is not valid).
+static void timestampField(char* out, size_t cap) {
+  String timestamp = isoTimestampUtc();
+  if (timestamp.length() > 0) {
+    snprintf(out, cap, "\"timestamp\":\"%s\",", timestamp.c_str());
+  } else {
+    out[0] = '\0';
   }
-
-  Serial.printf("[LocalMQTT] Sensor type loaded -> %u (%s)\n",
-                gSensorType,
-                sensorTypeLabel(gSensorType));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -301,10 +234,9 @@ static void localMqttConnect() {
 }
 
 void localMqttInit() {
-  loadSensorType();
   loadBroker();
 
-  localMqtt.setBufferSize(1024);
+  localMqtt.setBufferSize(1280);   // power payload is ~0.7-1 KB, see docs/payload.md
   localMqtt.setKeepAlive(30);
   localMqtt.setSocketTimeout(5);
 
@@ -326,13 +258,11 @@ void localMqttHandle() {
   if (localMqtt.connected()) {
     localMqtt.loop();
 
-    // Publish attributes every 60 seconds.
-    // This lets the API endpoint /api/devices/{device_id}/thresholds_from_device
-    // find threshold-like fields in the "attributes" measurement.
+    // Publish attributes every 60 seconds (retained).
     unsigned long now = millis();
     if (now - lastAttributesPublish >= 60000UL) {
       lastAttributesPublish = now;
-      localMqttPublishConfig(30.0f, 10.0f, 80.0f, 40.0f, 1000.0f);
+      localMqttPublishAttributes();
     }
 
     return;
@@ -351,7 +281,7 @@ bool localMqttIsConnected() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Publish telemetry / soil / mineral data
+// Publish power meter data
 // ─────────────────────────────────────────────────────────────────────────────
 
 void localMqttPublish() {
@@ -361,251 +291,48 @@ void localMqttPublish() {
 
   String deviceId = getDeviceId();
   String topic = buildDataTopic();
-  String timestamp = isoTimestampUtc();
 
-  char payload[900];
+  char tsField[48];
+  timestampField(tsField, sizeof(tsField));
 
-  if (gSensorType == 1) {
-    // Environment sensor.
-    if (timestamp.length() > 0) {
-      snprintf(
-        payload,
-        sizeof(payload),
-        "{"
-          "\"device_id\":\"%s\","
-          "\"timestamp\":\"%s\","
-          "\"reading\":{"
-            "\"sensor_type\":%u,"
-            "\"sensor_type_label\":\"%s\","
-            "\"firmware\":\"%s\","
-            "\"rssi\":%d,"
-            "\"temperature\":%.2f,"
-            "\"humidity\":%.2f,"
-            "\"co2\":%d,"
-            "\"eco2\":%d,"
-            "\"co2_label\":\"%s\","
-            "\"co2_valid\":%s,"
-            "\"alert_temp\":%s,"
-            "\"alert_temp_num\":%d,"
-            "\"alert_hum\":%s,"
-            "\"alert_hum_num\":%d,"
-            "\"alert_co2\":%s,"
-            "\"alert_co2_num\":%d,"
-            "\"light_on\":%s,"
-            "\"light_on_num\":%d"
-          "}"
-        "}",
-        deviceId.c_str(),
-        timestamp.c_str(),
-        gSensorType,
-        sensorTypeLabel(gSensorType),
-        FIRMWARE_VERSION,
-        WiFi.RSSI(),
-        sensorTemp,
-        sensorHum,
-        sensorCO2,
-        sensorCO2,
-        co2LabelLocal(sensorCO2),
-        boolText(sensorCO2 > 0),
-        boolText(alertTemp),
-        boolNum(alertTemp),
-        boolText(alertHum),
-        boolNum(alertHum),
-        boolText(alertCO2),
-        boolNum(alertCO2),
-        boolText(ldrLightOn),
-        boolNum(ldrLightOn)
-      );
-    } else {
-      snprintf(
-        payload,
-        sizeof(payload),
-        "{"
-          "\"device_id\":\"%s\","
-          "\"reading\":{"
-            "\"sensor_type\":%u,"
-            "\"sensor_type_label\":\"%s\","
-            "\"firmware\":\"%s\","
-            "\"rssi\":%d,"
-            "\"temperature\":%.2f,"
-            "\"humidity\":%.2f,"
-            "\"co2\":%d,"
-            "\"eco2\":%d,"
-            "\"co2_label\":\"%s\","
-            "\"co2_valid\":%s,"
-            "\"alert_temp\":%s,"
-            "\"alert_temp_num\":%d,"
-            "\"alert_hum\":%s,"
-            "\"alert_hum_num\":%d,"
-            "\"alert_co2\":%s,"
-            "\"alert_co2_num\":%d,"
-            "\"light_on\":%s,"
-            "\"light_on_num\":%d"
-          "}"
-        "}",
-        deviceId.c_str(),
-        gSensorType,
-        sensorTypeLabel(gSensorType),
-        FIRMWARE_VERSION,
-        WiFi.RSSI(),
-        sensorTemp,
-        sensorHum,
-        sensorCO2,
-        sensorCO2,
-        co2LabelLocal(sensorCO2),
-        boolText(sensorCO2 > 0),
-        boolText(alertTemp),
-        boolNum(alertTemp),
-        boolText(alertHum),
-        boolNum(alertHum),
-        boolText(alertCO2),
-        boolNum(alertCO2),
-        boolText(ldrLightOn),
-        boolNum(ldrLightOn)
-      );
-    }
-  } else if (gSensorType == 2) {
-    // Soil sensor (Halisense or XS-MEC20, see rs485SoilModel()). ph/n/p/k
-    // are populated for Halisense, always 0 for XS-MEC20 — kept in the
-    // payload either way so the Pi-side schema stays stable.
-    if (timestamp.length() > 0) {
-      snprintf(
-        payload,
-        sizeof(payload),
-        "{"
-          "\"device_id\":\"%s\","
-          "\"timestamp\":\"%s\","
-          "\"reading\":{"
-            "\"sensor_type\":%u,"
-            "\"sensor_type_label\":\"%s\","
-            "\"firmware\":\"%s\","
-            "\"rssi\":%d,"
-            "\"sensor_ok\":%s,"
-            "\"moisture\":%.1f,"
-            "\"temperature\":%.1f,"
-            "\"ec\":%.0f,"
-            "\"ph\":%.1f,"
-            "\"n\":%u,"
-            "\"p\":%u,"
-            "\"k\":%u,"
-            "\"alert_moist\":%s,"
-            "\"alert_ec\":%s,"
-            "\"alert_ph\":%s"
-          "}"
-        "}",
-        deviceId.c_str(),
-        timestamp.c_str(),
-        gSensorType,
-        sensorTypeLabel(gSensorType),
-        FIRMWARE_VERSION,
-        WiFi.RSSI(),
-        boolText(soilOK),
-        soilMoist, soilTemp, soilEc, soilPh,
-        soilN, soilP, soilK,
-        boolText(alertSoilMoist),
-        boolText(alertSoilEc),
-        boolText(alertSoilPh)
-      );
-    } else {
-      snprintf(
-        payload,
-        sizeof(payload),
-        "{"
-          "\"device_id\":\"%s\","
-          "\"reading\":{"
-            "\"sensor_type\":%u,"
-            "\"sensor_type_label\":\"%s\","
-            "\"firmware\":\"%s\","
-            "\"rssi\":%d,"
-            "\"sensor_ok\":%s,"
-            "\"moisture\":%.1f,"
-            "\"temperature\":%.1f,"
-            "\"ec\":%.0f,"
-            "\"ph\":%.1f,"
-            "\"n\":%u,"
-            "\"p\":%u,"
-            "\"k\":%u,"
-            "\"alert_moist\":%s,"
-            "\"alert_ec\":%s,"
-            "\"alert_ph\":%s"
-          "}"
-        "}",
-        deviceId.c_str(),
-        gSensorType,
-        sensorTypeLabel(gSensorType),
-        FIRMWARE_VERSION,
-        WiFi.RSSI(),
-        boolText(soilOK),
-        soilMoist, soilTemp, soilEc, soilPh,
-        soilN, soilP, soilK,
-        boolText(alertSoilMoist),
-        boolText(alertSoilEc),
-        boolText(alertSoilPh)
-      );
-    }
-  } else {
-    // Mineral sensor.
-    if (timestamp.length() > 0) {
-      snprintf(
-        payload,
-        sizeof(payload),
-        "{"
-          "\"device_id\":\"%s\","
-          "\"timestamp\":\"%s\","
-          "\"reading\":{"
-            "\"sensor_type\":%u,"
-            "\"sensor_type_label\":\"%s\","
-            "\"firmware\":\"%s\","
-            "\"rssi\":%d,"
-            "\"sensor_ok\":%s,"
-            "\"ph\":%.2f,"
-            "\"ec\":%.0f,"
-            "\"temperature\":%.1f,"
-            "\"alert_ph\":%s,"
-            "\"alert_ec\":%s"
-          "}"
-        "}",
-        deviceId.c_str(),
-        timestamp.c_str(),
-        gSensorType,
-        sensorTypeLabel(gSensorType),
-        FIRMWARE_VERSION,
-        WiFi.RSSI(),
-        boolText(waterOK),
-        waterPh, waterEc, waterTemp,
-        boolText(alertWaterPh),
-        boolText(alertWaterEc)
-      );
-    } else {
-      snprintf(
-        payload,
-        sizeof(payload),
-        "{"
-          "\"device_id\":\"%s\","
-          "\"reading\":{"
-            "\"sensor_type\":%u,"
-            "\"sensor_type_label\":\"%s\","
-            "\"firmware\":\"%s\","
-            "\"rssi\":%d,"
-            "\"sensor_ok\":%s,"
-            "\"ph\":%.2f,"
-            "\"ec\":%.0f,"
-            "\"temperature\":%.1f,"
-            "\"alert_ph\":%s,"
-            "\"alert_ec\":%s"
-          "}"
-        "}",
-        deviceId.c_str(),
-        gSensorType,
-        sensorTypeLabel(gSensorType),
-        FIRMWARE_VERSION,
-        WiFi.RSSI(),
-        boolText(waterOK),
-        waterPh, waterEc, waterTemp,
-        boolText(alertWaterPh),
-        boolText(alertWaterEc)
-      );
-    }
+  char payload[1100];
+  int n = snprintf(
+    payload,
+    sizeof(payload),
+    "{"
+      "\"device_id\":\"%s\","
+      "%s"
+      "\"reading\":{"
+        "\"sensor_type\":%u,"
+        "\"sensor_type_label\":\"%s\","
+        "\"firmware\":\"%s\","
+        "\"rssi\":%d,"
+        "\"sensor_ok\":%s,"
+        "\"meter_ok\":%s,"
+        "\"simulated\":%s",
+    deviceId.c_str(),
+    tsField,
+    SENSOR_TYPE_ID,
+    SENSOR_TYPE_LABEL,
+    FIRMWARE_VERSION,
+    WiFi.RSSI(),
+    boolText(pm2200SensorOK),
+    boolText(pm2200MeterOK),
+    boolText(pm2200Simulated())
+  );
+
+  // Measurements: one table shared with the setup page (pm2200.cpp); keys without a value are left out.
+  if (n >= 0 && n < (int)sizeof(payload)) {
+    int m = pm2200ReadingJson(payload + n, sizeof(payload) - n);
+    n = (m < 0) ? -1 : n + m;
+  }
+  if (n >= 0 && n + 3 <= (int)sizeof(payload)) n += snprintf(payload + n, sizeof(payload) - n, "}}");
+  else n = -1;
+
+  if (n < 0) {
+    Serial.println("[LocalMQTT] Power payload too long — not published");
+    logPush("[LocalMQTT] payload too long");
+    return;
   }
 
   bool ok = localMqtt.publish(topic.c_str(), payload);
@@ -626,93 +353,52 @@ void localMqttPublish() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Publish attributes / thresholds
+// Publish attributes (retained)
 // ─────────────────────────────────────────────────────────────────────────────
 
-void localMqttPublishConfig(float tempHigh,
-                            float tempLow,
-                            float humHigh,
-                            float humLow,
-                            float co2High) {
+void localMqttPublishAttributes() {
   if (!localMqtt.connected()) {
     return;
   }
 
   String deviceId = getDeviceId();
   String topic = buildAttributesTopic();
-  String timestamp = isoTimestampUtc();
+
+  char tsField[48];
+  timestampField(tsField, sizeof(tsField));
 
   char payload[700];
-
-  if (timestamp.length() > 0) {
-    snprintf(
-      payload,
-      sizeof(payload),
-      "{"
-        "\"device_id\":\"%s\","
-        "\"timestamp\":\"%s\","
-        "\"reading\":{"
-          "\"mac\":\"%s\","
-          "\"ip\":\"%s\","
-          "\"rssi\":%d,"
-          "\"firmware\":\"%s\","
-          "\"sensor_type\":%u,"
-          "\"sensor_type_label\":\"%s\","
-          "\"highTempThreshold\":%.2f,"
-          "\"lowTempThreshold\":%.2f,"
-          "\"highHumThreshold\":%.2f,"
-          "\"lowHumThreshold\":%.2f,"
-          "\"highEco2Threshold\":%.2f"
-        "}"
-      "}",
-      deviceId.c_str(),
-      timestamp.c_str(),
-      macNoColon().c_str(),
-      WiFi.localIP().toString().c_str(),
-      WiFi.RSSI(),
-      FIRMWARE_VERSION,
-      gSensorType,
-      sensorTypeLabel(gSensorType),
-      tempHigh,
-      tempLow,
-      humHigh,
-      humLow,
-      co2High
-    );
-  } else {
-    snprintf(
-      payload,
-      sizeof(payload),
-      "{"
-        "\"device_id\":\"%s\","
-        "\"reading\":{"
-          "\"mac\":\"%s\","
-          "\"ip\":\"%s\","
-          "\"rssi\":%d,"
-          "\"firmware\":\"%s\","
-          "\"sensor_type\":%u,"
-          "\"sensor_type_label\":\"%s\","
-          "\"highTempThreshold\":%.2f,"
-          "\"lowTempThreshold\":%.2f,"
-          "\"highHumThreshold\":%.2f,"
-          "\"lowHumThreshold\":%.2f,"
-          "\"highEco2Threshold\":%.2f"
-        "}"
-      "}",
-      deviceId.c_str(),
-      macNoColon().c_str(),
-      WiFi.localIP().toString().c_str(),
-      WiFi.RSSI(),
-      FIRMWARE_VERSION,
-      gSensorType,
-      sensorTypeLabel(gSensorType),
-      tempHigh,
-      tempLow,
-      humHigh,
-      humLow,
-      co2High
-    );
-  }
+  snprintf(
+    payload,
+    sizeof(payload),
+    "{"
+      "\"device_id\":\"%s\","
+      "%s"
+      "\"reading\":{"
+        "\"mac\":\"%s\","
+        "\"ip\":\"%s\","
+        "\"rssi\":%d,"
+        "\"firmware\":\"%s\","
+        "\"sensor_type\":%u,"
+        "\"sensor_type_label\":\"%s\","
+        "\"meter_model\":\"PM2200\","
+        "\"modbus_addr\":%u,"
+        "\"baud\":%lu,"
+        "\"parity\":\"%c\""
+      "}"
+    "}",
+    deviceId.c_str(),
+    tsField,
+    macNoColon().c_str(),
+    WiFi.localIP().toString().c_str(),
+    WiFi.RSSI(),
+    FIRMWARE_VERSION,
+    SENSOR_TYPE_ID,
+    SENSOR_TYPE_LABEL,
+    pm2200Addr(),
+    (unsigned long)pm2200Baud(),
+    pm2200Parity()
+  );
 
   bool ok = localMqtt.publish(topic.c_str(), payload, true);
 
